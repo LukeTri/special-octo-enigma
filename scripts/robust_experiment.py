@@ -15,9 +15,10 @@ import math
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -124,7 +125,7 @@ def run_once(
     seed: int,
     out_dir: Path,
     extra_args: Sequence[str],
-) -> Path:
+) -> Tuple[Path, float]:
     run_name = f"robust_s{seed}_{mode}"
     cmd = [
         python_bin,
@@ -141,11 +142,13 @@ def run_once(
     cmd.extend(extra_args)
     print(f"\n[run] mode={mode} seed={seed}", flush=True)
     print(f"[cmd] {' '.join(shlex.quote(x) for x in cmd)}", flush=True)
+    t0 = time.perf_counter()
     subprocess.run(cmd, check=True)
+    runtime_seconds = time.perf_counter() - t0
     out_path = out_dir / f"{run_name}.json"
     if not out_path.exists():
         raise FileNotFoundError(f"Expected output JSON not found: {out_path}")
-    return out_path
+    return out_path, runtime_seconds
 
 
 def load_run_json(path: Path, mode: str) -> Dict[str, float]:
@@ -157,6 +160,18 @@ def load_run_json(path: Path, mode: str) -> Dict[str, float]:
             return next(iter(results.values()))
         raise KeyError(f"Mode '{mode}' missing in {path}. Keys: {list(results.keys())}")
     return results[mode]
+
+
+def infer_train_tokens_seen(run_payload: Dict[str, object]) -> float:
+    args = run_payload.get("args", {})
+    if not isinstance(args, dict):
+        return 0.0
+    steps = int(args.get("steps", 0) or 0)
+    batch_size = int(args.get("batch_size", 0) or 0)
+    seq_len = int(args.get("seq_len", 0) or 0)
+    if steps <= 0 or batch_size <= 0 or seq_len <= 0:
+        return 0.0
+    return float(steps * batch_size * seq_len)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -211,9 +226,10 @@ def main() -> None:
     extra_args = shlex.split(args.extra_args)
 
     raw: Dict[str, Dict[int, Dict[str, float]]] = {m: {} for m in modes}
+    run_stats: Dict[str, Dict[int, Dict[str, float]]] = {m: {} for m in modes}
     for seed in seeds:
         for mode in modes:
-            run_json = run_once(
+            run_json, runtime_seconds = run_once(
                 python_bin=args.python_bin,
                 experiment_script=exp_script,
                 mode=mode,
@@ -221,7 +237,17 @@ def main() -> None:
                 out_dir=out_dir,
                 extra_args=extra_args,
             )
+            payload = json.loads(run_json.read_text())
             raw[mode][seed] = load_run_json(run_json, mode=mode)
+            train_tokens_seen = infer_train_tokens_seen(payload)
+            train_tokens_per_sec = (
+                train_tokens_seen / runtime_seconds if runtime_seconds > 0 and train_tokens_seen > 0 else 0.0
+            )
+            run_stats[mode][seed] = {
+                "runtime_seconds": float(runtime_seconds),
+                "train_tokens_seen": float(train_tokens_seen),
+                "train_tokens_per_sec": float(train_tokens_per_sec),
+            }
 
     rng = np.random.default_rng(args.numpy_seed)
 
@@ -248,9 +274,61 @@ def main() -> None:
                 "min": stats.min_val,
                 "max": stats.max_val,
             }
+        runtime_vals = [run_stats[mode][s]["runtime_seconds"] for s in seeds if s in run_stats[mode]]
+        if runtime_vals:
+            rstats = summarize_metric(
+                runtime_vals,
+                n_bootstrap=args.n_bootstrap,
+                alpha=args.alpha,
+                rng=rng,
+            )
+            mode_summaries[mode]["runtime_seconds"] = {
+                "n": float(rstats.n),
+                "mean": rstats.mean,
+                "std": rstats.std,
+                "ci_low": rstats.ci_low,
+                "ci_high": rstats.ci_high,
+                "min": rstats.min_val,
+                "max": rstats.max_val,
+            }
+        tps_vals = [run_stats[mode][s]["train_tokens_per_sec"] for s in seeds if s in run_stats[mode]]
+        if tps_vals:
+            tstats = summarize_metric(
+                tps_vals,
+                n_bootstrap=args.n_bootstrap,
+                alpha=args.alpha,
+                rng=rng,
+            )
+            mode_summaries[mode]["train_tokens_per_sec"] = {
+                "n": float(tstats.n),
+                "mean": tstats.mean,
+                "std": tstats.std,
+                "ci_low": tstats.ci_low,
+                "ci_high": tstats.ci_high,
+                "min": tstats.min_val,
+                "max": tstats.max_val,
+            }
+        token_vals = [run_stats[mode][s]["train_tokens_seen"] for s in seeds if s in run_stats[mode]]
+        if token_vals:
+            kstats = summarize_metric(
+                token_vals,
+                n_bootstrap=args.n_bootstrap,
+                alpha=args.alpha,
+                rng=rng,
+            )
+            mode_summaries[mode]["train_tokens_seen"] = {
+                "n": float(kstats.n),
+                "mean": kstats.mean,
+                "std": kstats.std,
+                "ci_low": kstats.ci_low,
+                "ci_high": kstats.ci_high,
+                "min": kstats.min_val,
+                "max": kstats.max_val,
+            }
 
     baseline_mode = modes[0]
     paired: Dict[str, Dict[str, float]] = {}
+    paired_runtime: Dict[str, Dict[str, float]] = {}
     for mode in modes[1:]:
         common_seeds = [s for s in seeds if s in raw[baseline_mode] and s in raw[mode]]
         deltas = [
@@ -283,6 +361,64 @@ def main() -> None:
             "sign_test_p_value": sign["p_value"],
         }
 
+        runtime_common = [s for s in seeds if s in run_stats[baseline_mode] and s in run_stats[mode]]
+        if runtime_common:
+            runtime_deltas = [
+                run_stats[mode][s]["runtime_seconds"] - run_stats[baseline_mode][s]["runtime_seconds"]
+                for s in runtime_common
+            ]
+            speedups = [
+                run_stats[baseline_mode][s]["runtime_seconds"] / run_stats[mode][s]["runtime_seconds"]
+                for s in runtime_common
+                if run_stats[mode][s]["runtime_seconds"] > 0
+            ]
+            tps_ratios = [
+                run_stats[mode][s]["train_tokens_per_sec"] / run_stats[baseline_mode][s]["train_tokens_per_sec"]
+                for s in runtime_common
+                if run_stats[baseline_mode][s]["train_tokens_per_sec"] > 0
+            ]
+            if not speedups or not tps_ratios:
+                continue
+            runtime_delta_stats = summarize_metric(
+                runtime_deltas,
+                n_bootstrap=args.n_bootstrap,
+                alpha=args.alpha,
+                rng=rng,
+            )
+            speedup_stats = summarize_metric(
+                speedups,
+                n_bootstrap=args.n_bootstrap,
+                alpha=args.alpha,
+                rng=rng,
+            )
+            tps_ratio_stats = summarize_metric(
+                tps_ratios,
+                n_bootstrap=args.n_bootstrap,
+                alpha=args.alpha,
+                rng=rng,
+            )
+            runtime_sign = sign_test_two_sided([-x for x in runtime_deltas])  # faster => negative delta
+            paired_runtime[mode] = {
+                "baseline_mode": baseline_mode,
+                "target_mode": mode,
+                "n": float(runtime_delta_stats.n),
+                "mean_runtime_delta_seconds": runtime_delta_stats.mean,
+                "std_runtime_delta_seconds": runtime_delta_stats.std,
+                "runtime_delta_ci_low": runtime_delta_stats.ci_low,
+                "runtime_delta_ci_high": runtime_delta_stats.ci_high,
+                "mean_speedup_x": speedup_stats.mean,
+                "speedup_ci_low": speedup_stats.ci_low,
+                "speedup_ci_high": speedup_stats.ci_high,
+                "mean_tps_ratio": tps_ratio_stats.mean,
+                "tps_ratio_ci_low": tps_ratio_stats.ci_low,
+                "tps_ratio_ci_high": tps_ratio_stats.ci_high,
+                "faster_wins": runtime_sign["wins"],
+                "faster_losses": runtime_sign["losses"],
+                "ties": runtime_sign["ties"],
+                "faster_win_rate": runtime_sign["win_rate"],
+                "sign_test_p_value": runtime_sign["p_value"],
+            }
+
     payload = {
         "seeds": seeds,
         "modes": modes,
@@ -292,6 +428,8 @@ def main() -> None:
         "extra_args": extra_args,
         "mode_summaries": mode_summaries,
         "paired_deltas": paired,
+        "paired_runtime": paired_runtime,
+        "run_stats": run_stats,
         "raw": raw,
     }
     summary_json.write_text(json.dumps(payload, indent=2))
@@ -316,6 +454,22 @@ def main() -> None:
         lines.append(f"| {mode} | {ms['mean']:.6f} | {ms['std']:.6f} | {ci} |")
 
     lines.append("")
+    lines.append("## Runtime And Throughput")
+    lines.append("")
+    lines.append("| mode | runtime_s mean | runtime_s std | runtime_s 95% CI | train tok/s mean | train tok/s 95% CI |")
+    lines.append("|---|---:|---:|---:|---:|---:|")
+    for mode in modes:
+        rs = mode_summaries.get(mode, {}).get("runtime_seconds")
+        ts = mode_summaries.get(mode, {}).get("train_tokens_per_sec")
+        if rs is None or ts is None:
+            continue
+        rci = f"[{rs['ci_low']:.3f}, {rs['ci_high']:.3f}]"
+        tci = f"[{ts['ci_low']:.1f}, {ts['ci_high']:.1f}]"
+        lines.append(
+            f"| {mode} | {rs['mean']:.3f} | {rs['std']:.3f} | {rci} | {ts['mean']:.1f} | {tci} |"
+        )
+
+    lines.append("")
     lines.append("## Paired Deltas Vs Baseline")
     lines.append("")
     lines.append("| target | mean_delta | std_delta | 95% CI | win_rate | sign_test_p |")
@@ -328,6 +482,22 @@ def main() -> None:
         lines.append(
             f"| {mode} | {ps['mean_delta']:.6f} | {ps['std_delta']:.6f} | "
             f"{ci} | {ps['win_rate']:.3f} | {ps['sign_test_p_value']:.4f} |"
+        )
+
+    lines.append("")
+    lines.append("## Runtime Vs Baseline")
+    lines.append("")
+    lines.append("| target | mean_runtime_delta_s | runtime_delta 95% CI | mean_speedup_x | speedup 95% CI | faster_win_rate | sign_test_p |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|")
+    for mode in modes[1:]:
+        pr = paired_runtime.get(mode)
+        if pr is None:
+            continue
+        dci = f"[{pr['runtime_delta_ci_low']:.3f}, {pr['runtime_delta_ci_high']:.3f}]"
+        sci = f"[{pr['speedup_ci_low']:.3f}, {pr['speedup_ci_high']:.3f}]"
+        lines.append(
+            f"| {mode} | {pr['mean_runtime_delta_seconds']:+.3f} | {dci} | "
+            f"{pr['mean_speedup_x']:.3f} | {sci} | {pr['faster_win_rate']:.3f} | {pr['sign_test_p_value']:.4f} |"
         )
 
     summary_md.write_text("\n".join(lines) + "\n")
@@ -352,6 +522,31 @@ def main() -> None:
                 f"{mode:18s} delta={ps['mean_delta']:+.6f} "
                 f"ci=[{ps['ci_low']:+.6f}, {ps['ci_high']:+.6f}] "
                 f"win_rate={ps['win_rate']:.3f} p={ps['sign_test_p_value']:.4f}"
+            )
+
+    print("\n=== Runtime Summary ===")
+    for mode in modes:
+        rs = mode_summaries.get(mode, {}).get("runtime_seconds")
+        ts = mode_summaries.get(mode, {}).get("train_tokens_per_sec")
+        if rs is None or ts is None:
+            continue
+        print(
+            f"{mode:18s} runtime_s={rs['mean']:.3f} "
+            f"ci=[{rs['ci_low']:.3f}, {rs['ci_high']:.3f}] "
+            f"tok/s={ts['mean']:.1f}"
+        )
+
+    if paired_runtime:
+        print(f"\n=== Runtime Vs {baseline_mode} ===")
+        for mode in modes[1:]:
+            pr = paired_runtime.get(mode)
+            if pr is None:
+                continue
+            print(
+                f"{mode:18s} runtime_delta_s={pr['mean_runtime_delta_seconds']:+.3f} "
+                f"speedup_x={pr['mean_speedup_x']:.3f} "
+                f"faster_win_rate={pr['faster_win_rate']:.3f} "
+                f"p={pr['sign_test_p_value']:.4f}"
             )
 
     print(f"\nSaved summary JSON: {summary_json}")

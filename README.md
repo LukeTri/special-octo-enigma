@@ -78,6 +78,7 @@ Outputs:
 - raw per-run JSONs: `runs/robust/raw/`
 - aggregate summary: `runs/robust/summary.json`
 - readable report: `runs/robust/summary.md`
+- includes runtime + throughput stats (`runtime_seconds`, `train_tokens_per_sec`) and paired speedup-vs-baseline analysis
 
 ---
 
