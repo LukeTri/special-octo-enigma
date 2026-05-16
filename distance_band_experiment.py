@@ -423,9 +423,11 @@ class TinyTransformerLM(nn.Module):
 class RecallTaskConfig:
     seq_len: int = 256
     num_pairs: int = 96
-    key_vocab: int = 64
+    key_vocab: int = 128
     value_vocab: int = 64
     far_bias: float = 0.7
+    unique_keys: bool = True
+    target_mode: str = "all_values"
 
     @property
     def vocab_size(self) -> int:
@@ -481,6 +483,14 @@ def make_recall_batch(
             f"seq_len={cfg.seq_len} is too short for num_pairs={cfg.num_pairs}. "
             f"Need at least {cfg.required_length()}."
         )
+    if cfg.unique_keys and cfg.key_vocab < cfg.num_pairs:
+        raise ValueError(
+            f"unique_keys=True requires key_vocab >= num_pairs, got "
+            f"key_vocab={cfg.key_vocab}, num_pairs={cfg.num_pairs}. "
+            "Increase --key-vocab or pass --allow-key-repeats."
+        )
+    if cfg.target_mode not in ("final_only", "all_values"):
+        raise ValueError("target_mode must be one of: final_only, all_values")
 
     x = torch.full((batch_size, cfg.seq_len), cfg.pad_token, dtype=torch.long, device=device)
     y = torch.full((batch_size, cfg.seq_len), IGNORE_INDEX, dtype=torch.long, device=device)
@@ -488,7 +498,10 @@ def make_recall_batch(
     query_distances = torch.zeros((batch_size,), dtype=torch.long, device=device)
 
     for b in range(batch_size):
-        keys = [rng.randrange(0, cfg.key_vocab) for _ in range(cfg.num_pairs)]
+        if cfg.unique_keys:
+            keys = rng.sample(range(cfg.key_vocab), cfg.num_pairs)
+        else:
+            keys = [rng.randrange(0, cfg.key_vocab) for _ in range(cfg.num_pairs)]
         vals = [rng.randrange(0, cfg.value_vocab) for _ in range(cfg.num_pairs)]
         q_idx = sample_query_index(cfg.num_pairs, cfg.far_bias, rng=rng)
 
@@ -508,7 +521,13 @@ def make_recall_batch(
         seq_t = torch.tensor(seq, dtype=torch.long, device=device)
         x[b, : seq_t.numel()] = seq_t
 
-        # Predict answer token right after reading query key.
+        if cfg.target_mode == "all_values":
+            # Dense supervision teaches the per-sequence key->value bindings;
+            # the final query still requires retrieval from earlier context.
+            for i, key_pos in enumerate(key_positions):
+                y[b, key_pos] = cfg.value_offset + vals[i]
+
+        # Predict final answer token right after reading query key.
         answer_pred_pos = query_pos + 1
         y[b, answer_pred_pos] = answer_token
         answer_positions[b] = answer_pred_pos
@@ -813,8 +832,20 @@ def build_argparser() -> argparse.ArgumentParser:
     # Task
     p.add_argument("--seq-len", type=int, default=256, dest="seq_len")
     p.add_argument("--num-pairs", type=int, default=96, dest="num_pairs")
-    p.add_argument("--key-vocab", type=int, default=64, dest="key_vocab")
+    p.add_argument("--key-vocab", type=int, default=128, dest="key_vocab")
     p.add_argument("--value-vocab", type=int, default=64, dest="value_vocab")
+    p.add_argument(
+        "--allow-key-repeats",
+        action="store_true",
+        help="Allow repeated keys inside one sequence. Default uses unique keys to avoid ambiguous retrieval targets.",
+    )
+    p.add_argument(
+        "--target-mode",
+        type=str,
+        default="all_values",
+        choices=["final_only", "all_values"],
+        help="'all_values' trains on each key->value pair plus the final query; 'final_only' trains only final retrieval.",
+    )
     p.add_argument(
         "--far-bias",
         type=float,
@@ -912,6 +943,8 @@ def main() -> None:
         key_vocab=args.key_vocab,
         value_vocab=args.value_vocab,
         far_bias=args.far_bias,
+        unique_keys=not args.allow_key_repeats,
+        target_mode=args.target_mode,
     )
     if task_cfg.required_length() > task_cfg.seq_len:
         raise ValueError(
@@ -930,7 +963,8 @@ def main() -> None:
     print(
         f"task: seq_len={task_cfg.seq_len}, num_pairs={task_cfg.num_pairs}, "
         f"key_vocab={task_cfg.key_vocab}, value_vocab={task_cfg.value_vocab}, "
-        f"far_bias={task_cfg.far_bias}"
+        f"far_bias={task_cfg.far_bias}, unique_keys={task_cfg.unique_keys}, "
+        f"target_mode={task_cfg.target_mode}"
     )
 
     run_order = (

@@ -20,6 +20,8 @@ where `P_{i-j}` is distance-conditioned through causal bands and reduced per-ban
 - distance-binned accuracy
 - result JSON saved to `runs/<run_name>.json`
 
+By default, each sequence uses unique key tokens and trains on every key->value pair plus the final query. This avoids ambiguous repeated-key examples and gives the model dense in-context learning signal.
+
 ---
 
 ## Local Quickstart (Mac/Linux)
@@ -33,7 +35,7 @@ python distance_band_experiment.py \
   --mode compare \
   --bands "64:16,256:8,inf:4" \
   --d-model 128 --n-heads 4 --n-layers 4 \
-  --seq-len 256 --num-pairs 96 \
+  --seq-len 256 --num-pairs 96 --key-vocab 128 \
   --steps 600
 ```
 
@@ -70,7 +72,7 @@ python scripts/robust_experiment.py \
   --seeds "11,22,33,44,55,66,77" \
   --modes "baseline,distance_prefix,distance_per_band" \
   --metric answer_acc \
-  --extra-args "--device cuda --precision auto --torch-compile --steps 2000 --log-interval 100 --bands 64:16,256:8,inf:4"
+  --extra-args "--device cuda --precision auto --torch-compile --steps 2000 --log-interval 100 --num-pairs 96 --key-vocab 128 --bands 64:16,256:8,inf:4"
 ```
 
 Outputs:
@@ -143,7 +145,56 @@ The script updates the repo, installs deps, runs training, and writes logs into 
 
 - `--mode`: `compare|baseline|distance_prefix|distance_per_band`
 - `--bands`: e.g. `64:16,256:8,inf:4` (dims are per head)
+- `--key-vocab`: must be at least `--num-pairs` unless `--allow-key-repeats` is set
+- `--target-mode`: `all_values` (default) or `final_only`
 - `--device`: `auto|cpu|cuda|mps`
 - `--precision`: `auto|fp32|bf16|fp16`
 - `--torch-compile`
 - `--out-dir` and `--run-name` for results JSON organization
+
+---
+
+## Parameter Golf LM Objective
+
+`parameter_golf_distance_attention.py` adapts the Parameter Golf training script from the local KFAC/Muon setup and swaps in configurable attention modes while keeping the real FineWeb token-LM objective, validation loss, BPB metric, Muon optimizer, and throughput logging.
+
+Modes are selected with environment variables:
+
+- `ATTENTION_MODE=baseline`
+- `ATTENTION_MODE=distance_prefix`
+- `ATTENTION_MODE=distance_per_band`
+- `ATTENTION_BANDS=128:64,512:32,inf:16`
+
+Run a quick single mode:
+
+```bash
+ATTENTION_MODE=distance_prefix \
+ATTENTION_BANDS="128:64,512:32,inf:16" \
+ITERATIONS=2000 \
+MAX_WALLCLOCK_SECONDS=0 \
+python parameter_golf_distance_attention.py
+```
+
+Run all modes into separate output folders:
+
+```bash
+ITERATIONS=2000 \
+MAX_WALLCLOCK_SECONDS=0 \
+ATTENTION_BANDS="128:64,512:32,inf:16" \
+bash scripts/run_parameter_golf_attention.sh
+```
+
+The script expects Parameter Golf data at:
+
+- `data/datasets/fineweb10B_sp1024`
+- `data/tokenizers/fineweb_1024_bpe.model`
+
+Override with:
+
+```bash
+DATA_PATH=/workspace/data/datasets/fineweb10B_sp1024 \
+TOKENIZER_PATH=/workspace/data/tokenizers/fineweb_1024_bpe.model \
+bash scripts/run_parameter_golf_attention.sh
+```
+
+Note: the current distance-banded implementation is a correctness/quality prototype and still uses dense score tensors internally. It is useful for LM-quality comparisons first; a real speed win needs a more fused/windowed implementation.
