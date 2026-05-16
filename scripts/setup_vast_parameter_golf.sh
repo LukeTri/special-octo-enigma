@@ -15,7 +15,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV_DIR="${VENV_DIR:-${REPO_ROOT}/.venv}"
-TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu124}"
+TORCH_INDEX_URL="${TORCH_INDEX_URL:-auto}"
 TRAIN_SHARDS="${TRAIN_SHARDS:-32}"
 SKIP_DATA="${SKIP_DATA:-0}"
 
@@ -23,7 +23,7 @@ cd "${REPO_ROOT}"
 
 echo "[setup] repo: ${REPO_ROOT}"
 echo "[setup] venv: ${VENV_DIR}"
-echo "[setup] torch index: ${TORCH_INDEX_URL}"
+echo "[setup] torch index: ${TORCH_INDEX_URL} (auto means PyPI/default requirements)"
 echo "[setup] train shards: ${TRAIN_SHARDS}"
 
 if ! command -v git >/dev/null 2>&1; then
@@ -52,19 +52,23 @@ source "${VENV_DIR}/bin/activate"
 
 python -m pip install --upgrade pip setuptools wheel
 
-# Install PyTorch separately so Vast machines with CUDA 12.4-era drivers do not
-# accidentally get a newer default wheel that cannot initialize CUDA.
-echo
-echo "[setup] Installing PyTorch from ${TORCH_INDEX_URL}"
-python -m pip uninstall -y torch >/dev/null 2>&1 || true
-python -m pip install torch --index-url "${TORCH_INDEX_URL}"
+if [ "${TORCH_INDEX_URL}" = "auto" ]; then
+  echo
+  echo "[setup] Installing requirements from PyPI/default indexes"
+  python -m pip install -r requirements.txt
+else
+  echo
+  echo "[setup] Installing PyTorch from ${TORCH_INDEX_URL}"
+  python -m pip uninstall -y torch >/dev/null 2>&1 || true
+  python -m pip install torch --index-url "${TORCH_INDEX_URL}"
 
-echo
-echo "[setup] Installing non-Torch requirements"
-REQ_TMP="$(mktemp)"
-grep -Ev '^[[:space:]]*torch([<>=~! ]|$)' requirements.txt > "${REQ_TMP}"
-python -m pip install -r "${REQ_TMP}"
-rm -f "${REQ_TMP}"
+  echo
+  echo "[setup] Installing non-Torch requirements"
+  REQ_TMP="$(mktemp)"
+  grep -Ev '^[[:space:]]*torch([<>=~! ]|$)' requirements.txt > "${REQ_TMP}"
+  python -m pip install -r "${REQ_TMP}"
+  rm -f "${REQ_TMP}"
+fi
 
 echo
 echo "[setup] Checking CUDA from PyTorch"

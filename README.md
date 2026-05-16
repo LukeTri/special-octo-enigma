@@ -164,7 +164,7 @@ Fresh Vast setup after cloning/pulling:
 bash scripts/setup_vast_parameter_golf.sh
 ```
 
-This creates `.venv`, installs a CUDA 12.4-compatible PyTorch wheel by default, installs the remaining dependencies, downloads/links the cached Parameter Golf FineWeb data, and checks that CUDA plus the tokenizer/data paths work.
+This creates `.venv`, installs dependencies, downloads/links the cached Parameter Golf FineWeb data, and checks that CUDA plus the tokenizer/data paths work. By default it uses the normal PyPI/default PyTorch package; set `TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126` only if you need to force a specific CUDA wheel.
 
 Modes are selected with environment variables:
 
