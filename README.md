@@ -55,6 +55,30 @@ python distance_band_experiment.py \
   --log-interval 100
 ```
 
+### Robust Evaluation Protocol (Recommended)
+
+Single runs are noisy. Use multi-seed paired comparisons:
+
+- run each mode with the same `--seed` and data seeds derived from it
+- aggregate over multiple seeds
+- compare deltas vs baseline with confidence intervals and sign test
+
+Run robust sweep:
+
+```bash
+python scripts/robust_experiment.py \
+  --seeds "11,22,33,44,55,66,77" \
+  --modes "baseline,distance_prefix,distance_per_band" \
+  --metric answer_acc \
+  --extra-args "--device cuda --precision auto --torch-compile --steps 2000 --log-interval 100 --bands 64:16,256:8,inf:4"
+```
+
+Outputs:
+
+- raw per-run JSONs: `runs/robust/raw/`
+- aggregate summary: `runs/robust/summary.json`
+- readable report: `runs/robust/summary.md`
+
 ---
 
 ## Put This On GitHub
@@ -122,4 +146,3 @@ The script updates the repo, installs deps, runs training, and writes logs into 
 - `--precision`: `auto|fp32|bf16|fp16`
 - `--torch-compile`
 - `--out-dir` and `--run-name` for results JSON organization
-

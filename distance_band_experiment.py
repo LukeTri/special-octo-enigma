@@ -33,12 +33,20 @@ import torch.nn.functional as F
 
 
 IGNORE_INDEX = -100
+BatchData = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 @dataclasses.dataclass(frozen=True)
 class BandSpec:
     max_distance: Optional[int]  # None means +infinity
     dim: int
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def parse_band_spec(spec: str) -> List[BandSpec]:
@@ -448,7 +456,7 @@ class RecallTaskConfig:
         return 1 + 2 * self.num_pairs + 3
 
 
-def sample_query_index(num_pairs: int, far_bias: float) -> int:
+def sample_query_index(num_pairs: int, far_bias: float, rng: random.Random) -> int:
     """
     Pick the queried key index.
     Higher far_bias increases probability of querying earlier pairs, which
@@ -456,17 +464,18 @@ def sample_query_index(num_pairs: int, far_bias: float) -> int:
     """
     if num_pairs <= 1:
         return 0
-    if random.random() < far_bias:
+    if rng.random() < far_bias:
         # Earlier key => farther distance to query position.
-        return random.randrange(0, max(1, num_pairs // 3))
-    return random.randrange(0, num_pairs)
+        return rng.randrange(0, max(1, num_pairs // 3))
+    return rng.randrange(0, num_pairs)
 
 
 def make_recall_batch(
     batch_size: int,
     cfg: RecallTaskConfig,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    rng: random.Random,
+) -> BatchData:
     if cfg.required_length() > cfg.seq_len:
         raise ValueError(
             f"seq_len={cfg.seq_len} is too short for num_pairs={cfg.num_pairs}. "
@@ -479,21 +488,21 @@ def make_recall_batch(
     query_distances = torch.zeros((batch_size,), dtype=torch.long, device=device)
 
     for b in range(batch_size):
-        keys = torch.randint(0, cfg.key_vocab, (cfg.num_pairs,), device=device)
-        vals = torch.randint(0, cfg.value_vocab, (cfg.num_pairs,), device=device)
-        q_idx = sample_query_index(cfg.num_pairs, cfg.far_bias)
+        keys = [rng.randrange(0, cfg.key_vocab) for _ in range(cfg.num_pairs)]
+        vals = [rng.randrange(0, cfg.value_vocab) for _ in range(cfg.num_pairs)]
+        q_idx = sample_query_index(cfg.num_pairs, cfg.far_bias, rng=rng)
 
         seq: List[int] = [cfg.bos_token]
         key_positions: List[int] = []
         for i in range(cfg.num_pairs):
             key_positions.append(len(seq))
-            seq.append(cfg.key_offset + int(keys[i].item()))
-            seq.append(cfg.value_offset + int(vals[i].item()))
+            seq.append(cfg.key_offset + keys[i])
+            seq.append(cfg.value_offset + vals[i])
 
         query_pos = len(seq)
         seq.append(cfg.query_token)
-        seq.append(cfg.key_offset + int(keys[q_idx].item()))
-        answer_token = cfg.value_offset + int(vals[q_idx].item())
+        seq.append(cfg.key_offset + keys[q_idx])
+        answer_token = cfg.value_offset + vals[q_idx]
         seq.append(answer_token)
 
         seq_t = torch.tensor(seq, dtype=torch.long, device=device)
@@ -518,12 +527,24 @@ def distance_bin_name(low: int, high: Optional[int]) -> str:
     return f"[{low},{high})"
 
 
-def evaluate(
-    model: TinyTransformerLM,
+def build_eval_batches(
     cfg: RecallTaskConfig,
     device: torch.device,
-    eval_batches: int,
     batch_size: int,
+    num_batches: int,
+    seed: int,
+) -> List[BatchData]:
+    rng = random.Random(seed)
+    batches: List[BatchData] = []
+    for _ in range(num_batches):
+        batches.append(make_recall_batch(batch_size=batch_size, cfg=cfg, device=device, rng=rng))
+    return batches
+
+
+def evaluate_on_batches(
+    model: TinyTransformerLM,
+    cfg: RecallTaskConfig,
+    batches: Sequence[BatchData],
     distance_bin_edges: Sequence[int],
     amp_dtype: Optional[torch.dtype] = None,
 ) -> Dict[str, float]:
@@ -541,9 +562,8 @@ def evaluate(
         stats[name] = [0, 0]  # correct, total
 
     with torch.no_grad():
-        for _ in range(eval_batches):
-            x, y, answer_pos, dists = make_recall_batch(batch_size=batch_size, cfg=cfg, device=device)
-            if amp_dtype is not None and device.type == "cuda":
+        for x, y, answer_pos, dists in batches:
+            if amp_dtype is not None and x.device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=amp_dtype):
                     logits = model(x)
             else:
@@ -556,7 +576,7 @@ def evaluate(
             )
             total_loss += float(loss.item())
 
-            batch_idx = torch.arange(x.size(0), device=device)
+            batch_idx = torch.arange(x.size(0), device=x.device)
             pred = logits[batch_idx, answer_pos].argmax(dim=-1)
             tgt = y[batch_idx, answer_pos]
             correct = pred.eq(tgt)
@@ -591,7 +611,12 @@ def train_one(
     task_cfg: RecallTaskConfig,
     device: torch.device,
     amp_dtype: Optional[torch.dtype],
+    model_seed: int,
+    train_data_seed: int,
+    val_seed: int,
+    test_seed: int,
 ) -> Dict[str, float]:
+    set_global_seed(model_seed)
     model = TinyTransformerLM(
         vocab_size=task_cfg.vocab_size,
         seq_len=task_cfg.seq_len,
@@ -626,10 +651,32 @@ def train_one(
         scaler = torch.amp.GradScaler("cuda", enabled=scaler_enabled)
     else:
         scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
+
+    train_rng = random.Random(train_data_seed)
+    val_batches = build_eval_batches(
+        cfg=task_cfg,
+        device=device,
+        batch_size=args.eval_batch_size,
+        num_batches=args.eval_batches,
+        seed=val_seed,
+    )
+    test_batches = build_eval_batches(
+        cfg=task_cfg,
+        device=device,
+        batch_size=args.eval_batch_size,
+        num_batches=args.eval_batches * 2,
+        seed=test_seed,
+    )
+
     eval_edges = [0, 32, 64, 128, 256, 512]
     for step in range(1, args.steps + 1):
         model.train()
-        x, y, _, _ = make_recall_batch(batch_size=args.batch_size, cfg=task_cfg, device=device)
+        x, y, _, _ = make_recall_batch(
+            batch_size=args.batch_size,
+            cfg=task_cfg,
+            device=device,
+            rng=train_rng,
+        )
 
         amp_ctx = (
             torch.autocast(device_type="cuda", dtype=amp_dtype)
@@ -660,12 +707,10 @@ def train_one(
             optimizer.step()
 
         if step % args.log_interval == 0 or step == 1 or step == args.steps:
-            metrics = evaluate(
+            metrics = evaluate_on_batches(
                 model=model,
                 cfg=task_cfg,
-                device=device,
-                eval_batches=args.eval_batches,
-                batch_size=args.eval_batch_size,
+                batches=val_batches,
                 distance_bin_edges=eval_edges,
                 amp_dtype=amp_dtype,
             )
@@ -677,12 +722,10 @@ def train_one(
                     metric_bits.append(f"{k}={metrics[k]:.4f}")
             print(" | ".join(metric_bits))
 
-    final = evaluate(
+    final = evaluate_on_batches(
         model=model,
         cfg=task_cfg,
-        device=device,
-        eval_batches=args.eval_batches * 2,
-        batch_size=args.eval_batch_size,
+        batches=test_batches,
         distance_bin_edges=eval_edges,
         amp_dtype=amp_dtype,
     )
@@ -726,6 +769,24 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Band spec as 'max_dist:dim,max_dist:dim,...' where dim is per head.",
     )
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument(
+        "--data-seed",
+        type=int,
+        default=-1,
+        help="Training-data RNG seed. Default -1 means reuse --seed.",
+    )
+    p.add_argument(
+        "--val-seed",
+        type=int,
+        default=-1,
+        help="Validation set seed. Default -1 means --seed + 1.",
+    )
+    p.add_argument(
+        "--test-seed",
+        type=int,
+        default=-1,
+        help="Test set seed. Default -1 means --seed + 2.",
+    )
     p.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     p.add_argument(
         "--precision",
@@ -800,6 +861,10 @@ def choose_amp_dtype(precision: str, device: torch.device) -> Optional[torch.dty
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
+def resolve_seed(value: int, fallback: int) -> int:
+    return fallback if value < 0 else value
+
+
 def save_results(
     args: argparse.Namespace,
     task_cfg: RecallTaskConfig,
@@ -830,14 +895,12 @@ def save_results(
 def main() -> None:
     args = build_argparser().parse_args()
 
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-
     bands = parse_band_spec(args.bands)
     device = choose_device(args.device)
     amp_dtype = choose_amp_dtype(args.precision, device)
+    train_data_seed = resolve_seed(args.data_seed, args.seed)
+    val_seed = resolve_seed(args.val_seed, args.seed + 1)
+    test_seed = resolve_seed(args.test_seed, args.seed + 2)
 
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -861,6 +924,10 @@ def main() -> None:
     print(f"mode={args.mode}")
     print(f"device={device.type} | amp={amp_dtype} | torch_compile={args.torch_compile}")
     print(
+        f"seeds: model={args.seed} train_data={train_data_seed} "
+        f"val={val_seed} test={test_seed}"
+    )
+    print(
         f"task: seq_len={task_cfg.seq_len}, num_pairs={task_cfg.num_pairs}, "
         f"key_vocab={task_cfg.key_vocab}, value_vocab={task_cfg.value_vocab}, "
         f"far_bias={task_cfg.far_bias}"
@@ -880,6 +947,10 @@ def main() -> None:
             task_cfg=task_cfg,
             device=device,
             amp_dtype=amp_dtype,
+            model_seed=args.seed,
+            train_data_seed=train_data_seed,
+            val_seed=val_seed,
+            test_seed=test_seed,
         )
 
     print_summary(results)
