@@ -189,6 +189,14 @@ The script expects Parameter Golf data at:
 - `data/datasets/fineweb10B_sp1024`
 - `data/tokenizers/fineweb_1024_bpe.model`
 
+Download/link the official cached Parameter Golf FineWeb data:
+
+```bash
+TRAIN_SHARDS=32 bash scripts/download_parameter_golf_data.sh
+```
+
+`TRAIN_SHARDS=32` is a good pilot size for debugging. Use `TRAIN_SHARDS=300` for the upstream default training split size.
+
 Override with:
 
 ```bash
