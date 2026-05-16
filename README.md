@@ -158,6 +158,14 @@ The script updates the repo, installs deps, runs training, and writes logs into 
 
 `parameter_golf_distance_attention.py` adapts the Parameter Golf training script from the local KFAC/Muon setup and swaps in configurable attention modes while keeping the real FineWeb token-LM objective, validation loss, BPB metric, Muon optimizer, and throughput logging.
 
+Fresh Vast setup after cloning/pulling:
+
+```bash
+bash scripts/setup_vast_parameter_golf.sh
+```
+
+This creates `.venv`, installs a CUDA 12.4-compatible PyTorch wheel by default, installs the remaining dependencies, downloads/links the cached Parameter Golf FineWeb data, and checks that CUDA plus the tokenizer/data paths work.
+
 Modes are selected with environment variables:
 
 - `ATTENTION_MODE=baseline`

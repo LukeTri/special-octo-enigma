@@ -12,6 +12,7 @@ UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/openai/parameter-golf.git}"
 UPSTREAM_DIR="${UPSTREAM_DIR:-${REPO_ROOT}/.upstream/parameter-golf}"
 VARIANT="${VARIANT:-sp1024}"
 TRAIN_SHARDS="${TRAIN_SHARDS:-32}"
+INSTALL_REQUIREMENTS="${INSTALL_REQUIREMENTS:-1}"
 
 DATASET_NAME="fineweb10B_${VARIANT}"
 TOKENIZER_NAME="fineweb_1024_bpe.model"
@@ -53,8 +54,12 @@ else
   git clone "${UPSTREAM_URL}" "${UPSTREAM_DIR}"
 fi
 
-echo "[data] Installing local Python requirements"
-python -m pip install -r "${REPO_ROOT}/requirements.txt"
+if [ "${INSTALL_REQUIREMENTS}" = "1" ]; then
+  echo "[data] Installing local Python requirements"
+  python -m pip install -r "${REPO_ROOT}/requirements.txt"
+else
+  echo "[data] Skipping requirement install because INSTALL_REQUIREMENTS=${INSTALL_REQUIREMENTS}"
+fi
 
 echo "[data] Downloading cached FineWeb data"
 echo "[data] variant=${VARIANT} train_shards=${TRAIN_SHARDS}"
