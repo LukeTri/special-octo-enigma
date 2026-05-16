@@ -27,6 +27,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.checkpoint import checkpoint
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -73,6 +74,8 @@ class Hyperparameters:
     attention_mode = os.environ.get("ATTENTION_MODE", "baseline").lower()
     attention_bands = os.environ.get("ATTENTION_BANDS", "128:64,512:32,inf:16")
     attention_band_bias = bool(int(os.environ.get("ATTENTION_BAND_BIAS", "1")))
+    attention_chunk_size = int(os.environ.get("ATTENTION_CHUNK_SIZE", "128"))
+    attention_checkpoint = bool(int(os.environ.get("ATTENTION_CHECKPOINT", "1")))
     torch_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))
 
     # Optimizer hyperparameters.
@@ -613,6 +616,8 @@ class CausalSelfAttention(nn.Module):
         attention_mode: str,
         attention_bands: list[BandSpec],
         attention_band_bias: bool,
+        attention_chunk_size: int,
+        attention_checkpoint: bool,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -626,6 +631,10 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.attention_mode = attention_mode
         self.attention_bands = attention_bands
+        if attention_chunk_size <= 0:
+            raise ValueError(f"ATTENTION_CHUNK_SIZE must be positive, got {attention_chunk_size}")
+        self.attention_chunk_size = attention_chunk_size
+        self.attention_checkpoint = attention_checkpoint
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         for band in attention_bands:
@@ -654,9 +663,10 @@ class CausalSelfAttention(nn.Module):
         else:
             self.register_parameter("band_bias", None)
 
-    def _band_mask(self, seq_len: int, band_idx: int, device: torch.device) -> Tensor:
-        pos = torch.arange(seq_len, device=device)
-        dist = pos[:, None] - pos[None, :]
+    def _band_mask(self, start: int, end: int, seq_len: int, band_idx: int, device: torch.device) -> Tensor:
+        q_pos = torch.arange(start, end, device=device)
+        k_pos = torch.arange(seq_len, device=device)
+        dist = q_pos[:, None] - k_pos[None, :]
         lower = 0 if band_idx == 0 else (self.attention_bands[band_idx - 1].max_distance or 0) + 1
         upper = self.attention_bands[band_idx].max_distance
         mask = dist >= lower
@@ -664,21 +674,21 @@ class CausalSelfAttention(nn.Module):
             mask = mask & (dist <= upper)
         return mask[None, None, :, :]
 
-    def _distance_attention(self, x: Tensor, v: Tensor, q_full: Tensor | None, k_full: Tensor | None) -> Tensor:
+    def _distance_qk_bands(
+        self,
+        x: Tensor,
+        q_full: Tensor | None,
+        k_full: Tensor | None,
+    ) -> tuple[list[Tensor], list[Tensor]]:
         bsz, seqlen, dim = x.shape
-        v = expand_kv_for_gqa(v, self.num_heads)
-        scores = torch.full(
-            (bsz, self.num_heads, seqlen, seqlen),
-            torch.finfo(x.dtype).min,
-            device=x.device,
-            dtype=x.dtype,
-        )
+        q_bands: list[Tensor] = []
+        k_bands: list[Tensor] = []
         for band_idx, band in enumerate(self.attention_bands):
             if self.attention_mode == "distance_prefix":
                 if q_full is None or k_full is None:
                     raise RuntimeError("distance_prefix requires shared Q/K projections")
                 q_band = q_full[..., : band.dim]
-                k_band = expand_kv_for_gqa(k_full[..., : band.dim], self.num_heads)
+                k_band = k_full[..., : band.dim]
             else:
                 q_band = self.band_q[band_idx](x).reshape(bsz, seqlen, self.num_heads, band.dim).transpose(1, 2)
                 k_band = self.band_k[band_idx](x).reshape(bsz, seqlen, self.num_kv_heads, band.dim).transpose(1, 2)
@@ -688,12 +698,65 @@ class CausalSelfAttention(nn.Module):
                 q_band = apply_rotary_emb(q_band, cos, sin)
                 k_band = apply_rotary_emb(k_band, cos, sin)
                 q_band = q_band * self.q_gain[band_idx].to(dtype=q_band.dtype)[None, :, None, None]
-                k_band = expand_kv_for_gqa(k_band, self.num_heads)
+            q_bands.append(q_band)
+            k_bands.append(k_band)
+        return q_bands, k_bands
+
+    def _distance_attention_chunk(
+        self,
+        start: int,
+        end: int,
+        seqlen: int,
+        v: Tensor,
+        q_bands: tuple[Tensor, ...],
+        k_bands: tuple[Tensor, ...],
+    ) -> Tensor:
+        scores: Tensor | None = None
+        for band_idx, band in enumerate(self.attention_bands):
+            q_band = q_bands[band_idx][:, :, start:end, :]
+            k_band = expand_kv_for_gqa(k_bands[band_idx], self.num_heads)
             band_scores = (q_band @ k_band.transpose(-2, -1)) * (band.dim ** -0.5)
             if self.band_bias is not None:
                 band_scores = band_scores + self.band_bias[band_idx].to(dtype=band_scores.dtype)
-            scores = torch.where(self._band_mask(seqlen, band_idx, x.device), band_scores, scores)
+            if scores is None:
+                scores = torch.full_like(band_scores, torch.finfo(band_scores.dtype).min)
+            mask = self._band_mask(start, end, seqlen, band_idx, band_scores.device)
+            scores = torch.where(mask, band_scores, scores)
+        if scores is None:
+            raise RuntimeError("distance attention requires at least one band")
         y = F.softmax(scores.float(), dim=-1).to(dtype=v.dtype) @ v
+        return y
+
+    def _distance_attention(self, x: Tensor, v: Tensor, q_full: Tensor | None, k_full: Tensor | None) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        v = expand_kv_for_gqa(v, self.num_heads)
+        q_bands, k_bands = self._distance_qk_bands(x, q_full, k_full)
+        q_tuple = tuple(q_bands)
+        k_tuple = tuple(k_bands)
+        chunks: list[Tensor] = []
+        chunk_size = min(self.attention_chunk_size, seqlen)
+        for start in range(0, seqlen, chunk_size):
+            end = min(start + chunk_size, seqlen)
+            if self.attention_checkpoint and torch.is_grad_enabled():
+                num_bands = len(q_tuple)
+                chunk_start = start
+                chunk_end = end
+
+                def run_chunk(
+                    v_in: Tensor,
+                    *qk_tensors: Tensor,
+                    chunk_start: int = chunk_start,
+                    chunk_end: int = chunk_end,
+                ) -> Tensor:
+                    q_inputs = qk_tensors[:num_bands]
+                    k_inputs = qk_tensors[num_bands:]
+                    return self._distance_attention_chunk(chunk_start, chunk_end, seqlen, v_in, q_inputs, k_inputs)
+
+                y_chunk = checkpoint(run_chunk, v, *q_tuple, *k_tuple, use_reentrant=False)
+            else:
+                y_chunk = self._distance_attention_chunk(start, end, seqlen, v, q_tuple, k_tuple)
+            chunks.append(y_chunk)
+        y = torch.cat(chunks, dim=2)
         return y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -753,6 +816,8 @@ class Block(nn.Module):
         attention_mode: str,
         attention_bands: list[BandSpec],
         attention_band_bias: bool,
+        attention_chunk_size: int,
+        attention_checkpoint: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -766,6 +831,8 @@ class Block(nn.Module):
             attention_mode,
             attention_bands,
             attention_band_bias,
+            attention_chunk_size,
+            attention_checkpoint,
         )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -798,6 +865,8 @@ class GPT(nn.Module):
         attention_mode: str,
         attention_bands: list[BandSpec],
         attention_band_bias: bool,
+        attention_chunk_size: int,
+        attention_checkpoint: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -822,6 +891,8 @@ class GPT(nn.Module):
                     attention_mode,
                     attention_bands,
                     attention_band_bias,
+                    attention_chunk_size,
+                    attention_checkpoint,
                 )
                 for i in range(num_layers)
             ]
@@ -981,6 +1052,8 @@ def main() -> None:
         attention_mode=args.attention_mode,
         attention_bands=attention_bands,
         attention_band_bias=args.attention_band_bias,
+        attention_chunk_size=args.attention_chunk_size,
+        attention_checkpoint=args.attention_checkpoint,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1052,7 +1125,9 @@ def main() -> None:
     log0(
         f"attention_mode:{args.attention_mode} num_heads:{args.num_heads} "
         f"num_kv_heads:{args.num_kv_heads} bands:{format_band_spec(attention_bands)} "
-        f"band_bias:{int(args.attention_band_bias)} torch_compile:{int(args.torch_compile)}"
+        f"band_bias:{int(args.attention_band_bias)} "
+        f"chunk_size:{args.attention_chunk_size} checkpoint:{int(args.attention_checkpoint)} "
+        f"torch_compile:{int(args.torch_compile)}"
     )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "

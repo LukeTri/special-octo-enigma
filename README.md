@@ -172,12 +172,17 @@ Modes are selected with environment variables:
 - `ATTENTION_MODE=distance_prefix`
 - `ATTENTION_MODE=distance_per_band`
 - `ATTENTION_BANDS=128:64,512:32,inf:16`
+- `ATTENTION_CHUNK_SIZE=128`
+- `ATTENTION_CHECKPOINT=1`
+
+The custom distance modes use chunked/checkpointed attention by default to avoid storing full dense `seq_len x seq_len` score tensors for every band during backward.
 
 Run a quick single mode:
 
 ```bash
 ATTENTION_MODE=distance_prefix \
 ATTENTION_BANDS="128:64,512:32,inf:16" \
+ATTENTION_CHUNK_SIZE=128 \
 ITERATIONS=2000 \
 MAX_WALLCLOCK_SECONDS=0 \
 python parameter_golf_distance_attention.py
@@ -189,6 +194,7 @@ Run all modes into separate output folders:
 ITERATIONS=2000 \
 MAX_WALLCLOCK_SECONDS=0 \
 ATTENTION_BANDS="128:64,512:32,inf:16" \
+ATTENTION_CHUNK_SIZE=128 \
 bash scripts/run_parameter_golf_attention.sh
 ```
 
@@ -213,4 +219,4 @@ TOKENIZER_PATH=/workspace/data/tokenizers/fineweb_1024_bpe.model \
 bash scripts/run_parameter_golf_attention.sh
 ```
 
-Note: the current distance-banded implementation is a correctness/quality prototype and still uses dense score tensors internally. It is useful for LM-quality comparisons first; a real speed win needs a more fused/windowed implementation.
+Note: the current distance-banded implementation is a correctness/quality prototype. It now chunks and checkpoints the dense score computation to avoid the earlier OOM path, but a real speed win still needs a more fused/windowed implementation.

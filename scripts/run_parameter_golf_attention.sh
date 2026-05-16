@@ -12,6 +12,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 MODES="${MODES:-baseline distance_prefix distance_per_band}"
 ATTENTION_BANDS="${ATTENTION_BANDS:-128:64,512:32,inf:16}"
+ATTENTION_CHUNK_SIZE="${ATTENTION_CHUNK_SIZE:-128}"
+ATTENTION_CHECKPOINT="${ATTENTION_CHECKPOINT:-1}"
 RUN_ROOT="${RUN_ROOT:-${REPO_ROOT}/runs/parameter_golf/$(date +%Y%m%d_%H%M%S)}"
 
 DATA_PATH="${DATA_PATH:-${REPO_ROOT}/data/datasets/fineweb10B_sp1024}"
@@ -23,6 +25,8 @@ echo "[pg] repo: ${REPO_ROOT}"
 echo "[pg] run root: ${RUN_ROOT}"
 echo "[pg] modes: ${MODES}"
 echo "[pg] bands: ${ATTENTION_BANDS}"
+echo "[pg] attention chunk size: ${ATTENTION_CHUNK_SIZE}"
+echo "[pg] attention checkpoint: ${ATTENTION_CHECKPOINT}"
 echo "[pg] data: ${DATA_PATH}"
 echo "[pg] tokenizer: ${TOKENIZER_PATH}"
 
@@ -38,6 +42,8 @@ for mode in ${MODES}; do
     TOKENIZER_PATH="${TOKENIZER_PATH}" \
     ATTENTION_MODE="${mode}" \
     ATTENTION_BANDS="${ATTENTION_BANDS}" \
+    ATTENTION_CHUNK_SIZE="${ATTENTION_CHUNK_SIZE}" \
+    ATTENTION_CHECKPOINT="${ATTENTION_CHECKPOINT}" \
     RUN_ID="${RUN_ID:-${mode}}" \
     python "${REPO_ROOT}/parameter_golf_distance_attention.py"
   )
@@ -45,4 +51,3 @@ done
 
 echo
 echo "[pg] complete: ${RUN_ROOT}"
-
