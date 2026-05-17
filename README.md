@@ -12,6 +12,12 @@ where `P_{i-j}` is distance-conditioned through causal bands and reduced per-ban
 - `distance_prefix`: shared Q/K, per-band prefix truncation
 - `distance_per_band`: separate learned Q/K projections per band
 
+Both distance modes can optionally bottleneck values per distance band, then lift
+the low-dimensional band output back to the normal head dimension after the
+shared softmax. This follows the implementation memo's recommendation to test
+whether far context can use lower-dimensional information transfer, not just
+lower-dimensional matching.
+
 ## Benchmark
 
 `distance_band_experiment.py` runs a synthetic long-range associative recall task and reports:
@@ -145,6 +151,8 @@ The script updates the repo, installs deps, runs training, and writes logs into 
 
 - `--mode`: `compare|baseline|distance_prefix|distance_per_band`
 - `--bands`: e.g. `64:16,256:8,inf:4` (dims are per head)
+- `--value-bands`: optional value bottlenecks with the same boundaries as `--bands`, e.g. `64:16,256:8,inf:4`
+- `--attention-backend`: `dense|flex`; `flex` uses PyTorch FlexAttention block masks plus LSE recombination
 - `--key-vocab`: must be at least `--num-pairs` unless `--allow-key-repeats` is set
 - `--target-mode`: `all_values` (default) or `final_only`
 - `--device`: `auto|cpu|cuda|mps`
@@ -172,21 +180,30 @@ Modes are selected with environment variables:
 - `ATTENTION_MODE=distance_prefix`
 - `ATTENTION_MODE=distance_per_band`
 - `ATTENTION_BANDS=128:64,512:32,inf:16`
+- `ATTENTION_VALUE_BANDS=128:64,512:48,inf:32` (optional; empty/off keeps full-dimensional values)
+- `ATTENTION_BACKEND=dense|flex` (default `dense`; `flex` uses multi-call FlexAttention with shared-LSE recombination)
 - `ATTENTION_CHUNK_SIZE=128`
+- `ATTENTION_FLEX_BLOCK_SIZE=128`
 - `ATTENTION_CHECKPOINT=1`
+- `SDP_KERNEL_MODE=auto|flash_only|math_only|mem_efficient_only` (default `auto`)
 
-The custom distance modes use chunked/checkpointed attention by default to avoid storing full dense `seq_len x seq_len` score tensors for every band during backward.
+The custom distance modes use one shared softmax denominator across distance bands. The default dense backend chunks/checkpoints the score computation. The FlexAttention backend instead runs one block-masked FlexAttention call per band, requests each band's row logsumexp, and recombines the band outputs into the same global softmax result. For real fused kernels, run with PyTorch compile enabled on CUDA; CPU FlexAttention is useful for no-grad sanity checks but does not support backward.
 
 Run a quick single mode:
 
 ```bash
 ATTENTION_MODE=distance_prefix \
 ATTENTION_BANDS="128:64,512:32,inf:16" \
+ATTENTION_VALUE_BANDS="128:64,512:48,inf:32" \
+ATTENTION_BACKEND=flex \
+ATTENTION_FLEX_BLOCK_SIZE=128 \
 ATTENTION_CHUNK_SIZE=128 \
 ITERATIONS=2000 \
 MAX_WALLCLOCK_SECONDS=0 \
 python parameter_golf_distance_attention.py
 ```
+
+For local smoke tests without a GPU, set `DEVICE=cpu` (or leave default `DEVICE=auto`, which falls back to CPU when CUDA is unavailable).
 
 Run all modes into separate output folders:
 
@@ -194,6 +211,9 @@ Run all modes into separate output folders:
 ITERATIONS=2000 \
 MAX_WALLCLOCK_SECONDS=0 \
 ATTENTION_BANDS="128:64,512:32,inf:16" \
+ATTENTION_VALUE_BANDS="128:64,512:48,inf:32" \
+ATTENTION_BACKEND=flex \
+ATTENTION_FLEX_BLOCK_SIZE=128 \
 ATTENTION_CHUNK_SIZE=128 \
 bash scripts/run_parameter_golf_attention.sh
 ```
@@ -219,4 +239,4 @@ TOKENIZER_PATH=/workspace/data/tokenizers/fineweb_1024_bpe.model \
 bash scripts/run_parameter_golf_attention.sh
 ```
 
-Note: the current distance-banded implementation is a correctness/quality prototype. It now chunks and checkpoints the dense score computation to avoid the earlier OOM path, but a real speed win still needs a more fused/windowed implementation.
+Note: the current distance-banded implementation is a correctness/quality prototype. It preserves exact shared-softmax normalization and can optionally test value bottlenecks, but a real speed win still needs a fused/windowed implementation.

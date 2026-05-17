@@ -31,6 +31,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from torch.nn.attention.flex_attention import AuxRequest, create_block_mask, flex_attention
+
+    FLEX_ATTENTION_AVAILABLE = True
+except Exception:
+    AuxRequest = None
+    create_block_mask = None
+    flex_attention = None
+    FLEX_ATTENTION_AVAILABLE = False
+
 
 IGNORE_INDEX = -100
 BatchData = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -108,6 +118,24 @@ def format_band_spec(bands: Sequence[BandSpec]) -> str:
         upper = "inf" if b.max_distance is None else str(b.max_distance)
         chunks.append(f"{upper}:{b.dim}")
     return ",".join(chunks)
+
+
+def parse_value_band_spec(spec: str, attention_bands: Sequence[BandSpec]) -> Optional[List[BandSpec]]:
+    if spec.strip().lower() in ("", "0", "off", "none", "false"):
+        return None
+    value_bands = parse_band_spec(spec)
+    if len(value_bands) != len(attention_bands):
+        raise ValueError(
+            "--value-bands must have the same number of bands as --bands; "
+            f"got {len(value_bands)} vs {len(attention_bands)}."
+        )
+    for idx, (score_band, value_band) in enumerate(zip(attention_bands, value_bands)):
+        if score_band.max_distance != value_band.max_distance:
+            raise ValueError(
+                "--value-bands must use the same distance boundaries as --bands; "
+                f"band {idx} has {value_band.max_distance} vs {score_band.max_distance}."
+            )
+    return value_bands
 
 
 def band_coverage_masks(
@@ -207,6 +235,9 @@ class DistanceBandedSelfAttention(nn.Module):
         n_heads: int,
         bands: Sequence[BandSpec],
         projection_mode: str = "prefix",
+        value_bands: Optional[Sequence[BandSpec]] = None,
+        attention_backend: str = "dense",
+        flex_block_size: int = 128,
         dropout: float = 0.0,
         learn_band_bias: bool = True,
     ) -> None:
@@ -220,7 +251,18 @@ class DistanceBandedSelfAttention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.bands = list(bands)
+        self.value_bands = list(value_bands) if value_bands is not None else None
         self.projection_mode = projection_mode
+        if attention_backend not in ("dense", "flex"):
+            raise ValueError("attention_backend must be one of: dense, flex")
+        if attention_backend == "flex" and not FLEX_ATTENTION_AVAILABLE:
+            raise RuntimeError("--attention-backend flex requested, but torch.nn.attention.flex_attention is unavailable")
+        if attention_backend == "flex" and dropout != 0.0:
+            raise ValueError("--attention-backend flex currently requires --dropout 0.0")
+        if flex_block_size <= 0:
+            raise ValueError(f"flex_block_size must be positive, got {flex_block_size}")
+        self.attention_backend = attention_backend
+        self.flex_block_size = flex_block_size
 
         for b in self.bands:
             if b.dim > self.head_dim:
@@ -228,6 +270,13 @@ class DistanceBandedSelfAttention(nn.Module):
                     f"Band dim {b.dim} exceeds head_dim={self.head_dim}. "
                     "Dims are per head."
                 )
+        if self.value_bands is not None:
+            for b in self.value_bands:
+                if b.dim > self.head_dim:
+                    raise ValueError(
+                        f"Value band dim {b.dim} exceeds head_dim={self.head_dim}. "
+                        "Dims are per head."
+                    )
 
         if projection_mode == "prefix":
             self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
@@ -238,7 +287,18 @@ class DistanceBandedSelfAttention(nn.Module):
             self.k_projs = nn.ModuleList(
                 nn.Linear(d_model, n_heads * b.dim, bias=False) for b in self.bands
             )
-            self.v_proj = nn.Linear(d_model, d_model, bias=False)
+            self.v_proj = None if self.value_bands is not None else nn.Linear(d_model, d_model, bias=False)
+
+        if self.value_bands is not None:
+            self.v_projs = nn.ModuleList(
+                nn.Linear(d_model, n_heads * b.dim, bias=False) for b in self.value_bands
+            )
+            self.v_lifts = nn.ModuleList(
+                nn.Linear(b.dim, self.head_dim, bias=False) for b in self.value_bands
+            )
+        else:
+            self.v_projs = nn.ModuleList()
+            self.v_lifts = nn.ModuleList()
 
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.attn_dropout = nn.Dropout(dropout)
@@ -250,12 +310,39 @@ class DistanceBandedSelfAttention(nn.Module):
             self.register_parameter("band_bias", None)
 
         self._mask_cache: Dict[Tuple[int, str], List[torch.Tensor]] = {}
+        self._flex_mask_cache: Dict[Tuple[int, int, str, int], object] = {}
 
     def _band_masks(self, seq_len: int, device: torch.device) -> List[torch.Tensor]:
         key = (seq_len, str(device))
         if key not in self._mask_cache:
             self._mask_cache[key] = band_coverage_masks(seq_len, self.bands, device)
         return self._mask_cache[key]
+
+    def _flex_band_mask(self, seq_len: int, band_idx: int, device: torch.device):
+        if create_block_mask is None:
+            raise RuntimeError("FlexAttention block-mask creation is unavailable")
+        key = (seq_len, band_idx, str(device), self.flex_block_size)
+        if key not in self._flex_mask_cache:
+            lower = 0 if band_idx == 0 else (self.bands[band_idx - 1].max_distance or 0) + 1
+            upper = self.bands[band_idx].max_distance
+
+            def mask_mod(_batch, _head, q_idx, kv_idx):
+                dist = q_idx - kv_idx
+                mask = dist >= lower
+                if upper is not None:
+                    mask = mask & (dist <= upper)
+                return mask
+
+            self._flex_mask_cache[key] = create_block_mask(
+                mask_mod,
+                None,
+                None,
+                seq_len,
+                seq_len,
+                device=device,
+                BLOCK_SIZE=self.flex_block_size,
+            )
+        return self._flex_mask_cache[key]
 
     def _compute_prefix_qkv(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seqlen, _ = x.shape
@@ -266,14 +353,131 @@ class DistanceBandedSelfAttention(nn.Module):
         v = v.view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
         return q, k, v
 
+    def _flex_attention_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        value: torch.Tensor,
+        band_idx: int,
+        band_dim: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if flex_attention is None or AuxRequest is None:
+            raise RuntimeError("FlexAttention is unavailable")
+        block_mask = self._flex_band_mask(q.size(2), band_idx, q.device)
+        out, aux = flex_attention(
+            q.contiguous(),
+            k.contiguous(),
+            value.contiguous(),
+            block_mask=block_mask,
+            scale=band_dim ** -0.5,
+            return_aux=AuxRequest(lse=True),
+        )
+        if aux.lse is None:
+            raise RuntimeError("FlexAttention did not return logsumexp statistics")
+        return out, aux.lse
+
+    def _forward_flex(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "cpu" and torch.is_grad_enabled() and x.requires_grad:
+            raise RuntimeError("--attention-backend flex does not support CPU backward; use --device cuda or --attention-backend dense")
+        bsz, seqlen, _ = x.shape
+        if self.projection_mode == "prefix":
+            q_full, k_full, v_full = self._compute_prefix_qkv(x)
+        else:
+            q_full = None
+            k_full = None
+            if self.v_proj is None:
+                v_full = None
+            else:
+                v_full = self.v_proj(x).view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+
+        outputs: List[torch.Tensor] = []
+        lses: List[torch.Tensor] = []
+        for idx, band in enumerate(self.bands):
+            if self.projection_mode == "prefix":
+                if q_full is None or k_full is None:
+                    raise RuntimeError("Prefix mode requires shared Q/K projections")
+                q_band = q_full[..., : band.dim]
+                k_band = k_full[..., : band.dim]
+            else:
+                q_band = (
+                    self.q_projs[idx](x)
+                    .view(bsz, seqlen, self.n_heads, band.dim)
+                    .transpose(1, 2)
+                )
+                k_band = (
+                    self.k_projs[idx](x)
+                    .view(bsz, seqlen, self.n_heads, band.dim)
+                    .transpose(1, 2)
+                )
+
+            if self.band_bias is not None:
+                bias = self.band_bias[idx].to(dtype=q_band.dtype)
+
+                def score_mod(score, _batch, _head, _q_idx, _kv_idx):
+                    return score + bias
+
+            else:
+                score_mod = None
+
+            if self.value_bands is None:
+                if v_full is None:
+                    raise RuntimeError("Full-dimensional value projection is not initialized")
+                value = v_full
+            else:
+                value_band = self.value_bands[idx]
+                value = (
+                    self.v_projs[idx](x)
+                    .view(bsz, seqlen, self.n_heads, value_band.dim)
+                    .transpose(1, 2)
+                )
+
+            if flex_attention is None or AuxRequest is None:
+                raise RuntimeError("FlexAttention is unavailable")
+            block_mask = self._flex_band_mask(seqlen, idx, x.device)
+            out, aux = flex_attention(
+                q_band.contiguous(),
+                k_band.contiguous(),
+                value.contiguous(),
+                score_mod=score_mod,
+                block_mask=block_mask,
+                scale=band.dim ** -0.5,
+                return_aux=AuxRequest(lse=True),
+            )
+            if aux.lse is None:
+                raise RuntimeError("FlexAttention did not return logsumexp statistics")
+            if self.value_bands is not None:
+                out = self.v_lifts[idx](out)
+            outputs.append(out)
+            lses.append(aux.lse)
+
+        global_lse = torch.logsumexp(torch.stack(lses, dim=0), dim=0)
+        out = torch.zeros(
+            bsz,
+            self.n_heads,
+            seqlen,
+            self.head_dim,
+            device=x.device,
+            dtype=outputs[0].dtype,
+        )
+        for band_out, lse in zip(outputs, lses):
+            out = out + torch.exp(lse - global_lse).to(dtype=band_out.dtype)[..., None] * band_out
+        out = out.transpose(1, 2).contiguous().view(bsz, seqlen, self.d_model)
+        return self.resid_dropout(self.out_proj(out))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.attention_backend == "flex":
+            return self._forward_flex(x)
+
         bsz, seqlen, _ = x.shape
         masks = self._band_masks(seqlen, x.device)
 
         if self.projection_mode == "prefix":
             q, k, v = self._compute_prefix_qkv(x)
         else:
-            v = self.v_proj(x).view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
+            if self.v_proj is None:
+                v = None
+            else:
+                v = self.v_proj(x).view(bsz, seqlen, self.n_heads, self.head_dim).transpose(1, 2)
 
         score_dtype = x.dtype
         scores = torch.full(
@@ -307,7 +511,28 @@ class DistanceBandedSelfAttention(nn.Module):
 
         probs = F.softmax(scores, dim=-1)
         probs = self.attn_dropout(probs)
-        out = probs @ v
+        if self.value_bands is None:
+            if v is None:
+                raise RuntimeError("Full-dimensional value projection is not initialized")
+            out = probs @ v
+        else:
+            out = torch.zeros(
+                bsz,
+                self.n_heads,
+                seqlen,
+                self.head_dim,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            zero_prob = torch.zeros((), device=probs.device, dtype=probs.dtype)
+            for idx, band in enumerate(self.value_bands):
+                z = (
+                    self.v_projs[idx](x)
+                    .view(bsz, seqlen, self.n_heads, band.dim)
+                    .transpose(1, 2)
+                )
+                band_probs = torch.where(masks[idx][None, None, :, :], probs, zero_prob)
+                out = out + self.v_lifts[idx](band_probs.to(dtype=z.dtype) @ z).to(dtype=out.dtype)
         out = out.transpose(1, 2).contiguous().view(bsz, seqlen, self.d_model)
         return self.resid_dropout(self.out_proj(out))
 
@@ -321,6 +546,9 @@ class TransformerBlock(nn.Module):
         dropout: float,
         attn_kind: str,
         bands: Sequence[BandSpec],
+        value_bands: Optional[Sequence[BandSpec]],
+        attention_backend: str,
+        flex_block_size: int,
     ) -> None:
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
@@ -333,6 +561,9 @@ class TransformerBlock(nn.Module):
                 n_heads=n_heads,
                 bands=bands,
                 projection_mode="prefix",
+                value_bands=value_bands,
+                attention_backend=attention_backend,
+                flex_block_size=flex_block_size,
                 dropout=dropout,
             )
         elif attn_kind == "distance_per_band":
@@ -341,6 +572,9 @@ class TransformerBlock(nn.Module):
                 n_heads=n_heads,
                 bands=bands,
                 projection_mode="per_band",
+                value_bands=value_bands,
+                attention_backend=attention_backend,
+                flex_block_size=flex_block_size,
                 dropout=dropout,
             )
         else:
@@ -372,6 +606,9 @@ class TinyTransformerLM(nn.Module):
         dropout: float,
         attn_kind: str,
         bands: Sequence[BandSpec],
+        value_bands: Optional[Sequence[BandSpec]],
+        attention_backend: str,
+        flex_block_size: int,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -388,6 +625,9 @@ class TinyTransformerLM(nn.Module):
                 dropout=dropout,
                 attn_kind=attn_kind,
                 bands=bands,
+                value_bands=value_bands,
+                attention_backend=attention_backend,
+                flex_block_size=flex_block_size,
             )
             for _ in range(n_layers)
         )
@@ -626,6 +866,7 @@ def evaluate_on_batches(
 def train_one(
     attn_kind: str,
     bands: Sequence[BandSpec],
+    value_bands: Optional[Sequence[BandSpec]],
     args: argparse.Namespace,
     task_cfg: RecallTaskConfig,
     device: torch.device,
@@ -636,6 +877,8 @@ def train_one(
     test_seed: int,
 ) -> Dict[str, float]:
     set_global_seed(model_seed)
+    effective_value_bands = value_bands if attn_kind != "baseline" else None
+    effective_backend = args.attention_backend if attn_kind != "baseline" else "dense"
     model = TinyTransformerLM(
         vocab_size=task_cfg.vocab_size,
         seq_len=task_cfg.seq_len,
@@ -646,6 +889,9 @@ def train_one(
         dropout=args.dropout,
         attn_kind=attn_kind,
         bands=bands,
+        value_bands=effective_value_bands,
+        attention_backend=effective_backend,
+        flex_block_size=args.flex_block_size,
     ).to(device)
 
     if args.torch_compile and hasattr(torch, "compile"):
@@ -662,7 +908,8 @@ def train_one(
     print(
         f"\n=== Training {attn_kind} ===\n"
         f"params={param_count:,} | bands={format_band_spec(bands)} | "
-        f"device={device.type} | amp={amp_dtype}"
+        f"value_bands={format_band_spec(effective_value_bands) if effective_value_bands is not None else 'full'} | "
+        f"backend={effective_backend} | device={device.type} | amp={amp_dtype}"
     )
 
     scaler_enabled = device.type == "cuda" and amp_dtype == torch.float16
@@ -787,6 +1034,29 @@ def build_argparser() -> argparse.ArgumentParser:
         default="64:16,256:8,inf:4",
         help="Band spec as 'max_dist:dim,max_dist:dim,...' where dim is per head.",
     )
+    p.add_argument(
+        "--value-bands",
+        default="",
+        dest="value_bands",
+        help=(
+            "Optional value bottleneck spec with the same distance boundaries as --bands, "
+            "for example '64:16,256:8,inf:4'. Empty/off keeps full-dimensional values."
+        ),
+    )
+    p.add_argument(
+        "--attention-backend",
+        default="dense",
+        choices=["dense", "flex"],
+        dest="attention_backend",
+        help="Distance-attention backend. 'flex' uses FlexAttention block masks plus LSE recombination.",
+    )
+    p.add_argument(
+        "--flex-block-size",
+        type=int,
+        default=128,
+        dest="flex_block_size",
+        help="Block size passed to FlexAttention block-mask construction.",
+    )
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument(
         "--data-seed",
@@ -900,6 +1170,7 @@ def save_results(
     args: argparse.Namespace,
     task_cfg: RecallTaskConfig,
     bands: Sequence[BandSpec],
+    value_bands: Optional[Sequence[BandSpec]],
     results: Dict[str, Dict[str, float]],
     device: torch.device,
     amp_dtype: Optional[torch.dtype],
@@ -915,6 +1186,9 @@ def save_results(
         "device": device.type,
         "amp_dtype": str(amp_dtype),
         "bands": format_band_spec(bands),
+        "value_bands": format_band_spec(value_bands) if value_bands is not None else None,
+        "attention_backend": args.attention_backend,
+        "flex_block_size": args.flex_block_size,
         "task": dataclasses.asdict(task_cfg),
         "args": vars(args),
         "results": results,
@@ -927,6 +1201,7 @@ def main() -> None:
     args = build_argparser().parse_args()
 
     bands = parse_band_spec(args.bands)
+    value_bands = parse_value_band_spec(args.value_bands, bands)
     device = choose_device(args.device)
     amp_dtype = choose_amp_dtype(args.precision, device)
     train_data_seed = resolve_seed(args.data_seed, args.seed)
@@ -954,8 +1229,12 @@ def main() -> None:
 
     print("Distance-Banded Attention Experiment")
     print(f"bands={format_band_spec(bands)}")
+    print(f"value_bands={format_band_spec(value_bands) if value_bands is not None else 'full'}")
     print(f"mode={args.mode}")
-    print(f"device={device.type} | amp={amp_dtype} | torch_compile={args.torch_compile}")
+    print(
+        f"backend={args.attention_backend} | flex_block_size={args.flex_block_size} | "
+        f"device={device.type} | amp={amp_dtype} | torch_compile={args.torch_compile}"
+    )
     print(
         f"seeds: model={args.seed} train_data={train_data_seed} "
         f"val={val_seed} test={test_seed}"
@@ -977,6 +1256,7 @@ def main() -> None:
         results[kind] = train_one(
             attn_kind=kind,
             bands=bands,
+            value_bands=value_bands,
             args=args,
             task_cfg=task_cfg,
             device=device,
@@ -992,6 +1272,7 @@ def main() -> None:
         args=args,
         task_cfg=task_cfg,
         bands=bands,
+        value_bands=value_bands,
         results=results,
         device=device,
         amp_dtype=amp_dtype,

@@ -29,6 +29,20 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import checkpoint
 
+try:
+    from torch.nn.attention.flex_attention import AuxRequest, create_block_mask, flex_attention
+
+    FLEX_ATTENTION_AVAILABLE = True
+except Exception:
+    AuxRequest = None
+    create_block_mask = None
+    flex_attention = None
+    FLEX_ATTENTION_AVAILABLE = False
+
+# Distance-band masks are fixed by sequence length/device/band specification, so reuse
+# them across layers instead of rebuilding a BlockMask in every attention module.
+_GLOBAL_FLEX_MASK_CACHE = {}
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -60,6 +74,7 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    device = os.environ.get("DEVICE", "auto").lower()
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -74,8 +89,12 @@ class Hyperparameters:
     attention_mode = os.environ.get("ATTENTION_MODE", "baseline").lower()
     attention_bands = os.environ.get("ATTENTION_BANDS", "128:64,512:32,inf:16")
     attention_band_bias = bool(int(os.environ.get("ATTENTION_BAND_BIAS", "1")))
+    attention_value_bands = os.environ.get("ATTENTION_VALUE_BANDS", "").strip()
+    attention_backend = os.environ.get("ATTENTION_BACKEND", "auto").lower()
     attention_chunk_size = int(os.environ.get("ATTENTION_CHUNK_SIZE", "128"))
+    attention_flex_block_size = int(os.environ.get("ATTENTION_FLEX_BLOCK_SIZE", str(attention_chunk_size)))
     attention_checkpoint = bool(int(os.environ.get("ATTENTION_CHECKPOINT", "1")))
+    sdp_kernel_mode = os.environ.get("SDP_KERNEL_MODE", "auto").lower()
     torch_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))
 
     # Optimizer hyperparameters.
@@ -231,6 +250,8 @@ def eval_val(
     world_size: int,
     device: torch.device,
     grad_accum_steps: int,
+    autocast_enabled: bool,
+    autocast_device_type: str,
     val_tokens: Tensor,
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
@@ -263,7 +284,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type=autocast_device_type, dtype=torch.bfloat16, enabled=autocast_enabled):
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -297,7 +318,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,band_bias,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -560,6 +581,19 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+def rotary_pair_prefix(x: Tensor, dim: int) -> Tensor:
+    # Keep complete RoPE coordinate pairs under the split-half convention used
+    # by apply_rotary_emb. A naive x[..., :dim] slice would take only the first
+    # half of the rotated representation when dim=head_dim/2.
+    if dim == x.size(-1):
+        return x
+    if dim % 2 != 0:
+        raise ValueError(f"RoPE prefix dimension must be even, got {dim}")
+    full_half = x.size(-1) // 2
+    half = dim // 2
+    return torch.cat((x[..., :half], x[..., full_half : full_half + half]), dim=-1)
+
+
 @dataclass(frozen=True)
 class BandSpec:
     max_distance: int | None
@@ -599,6 +633,24 @@ def format_band_spec(bands: list[BandSpec]) -> str:
     return ",".join(f"{'inf' if b.max_distance is None else b.max_distance}:{b.dim}" for b in bands)
 
 
+def parse_value_band_spec(spec: str, attention_bands: list[BandSpec]) -> list[BandSpec] | None:
+    if spec.lower() in {"", "0", "off", "none", "false"}:
+        return None
+    value_bands = parse_band_spec(spec)
+    if len(value_bands) != len(attention_bands):
+        raise ValueError(
+            "ATTENTION_VALUE_BANDS must have the same number of bands as ATTENTION_BANDS; "
+            f"got {len(value_bands)} vs {len(attention_bands)}"
+        )
+    for idx, (score_band, value_band) in enumerate(zip(attention_bands, value_bands, strict=True)):
+        if score_band.max_distance != value_band.max_distance:
+            raise ValueError(
+                "ATTENTION_VALUE_BANDS must use the same distance boundaries as ATTENTION_BANDS; "
+                f"band {idx} has {value_band.max_distance} vs {score_band.max_distance}"
+            )
+    return value_bands
+
+
 def expand_kv_for_gqa(x: Tensor, num_heads: int) -> Tensor:
     if x.size(1) == num_heads:
         return x
@@ -615,8 +667,11 @@ class CausalSelfAttention(nn.Module):
         qk_gain_init: float,
         attention_mode: str,
         attention_bands: list[BandSpec],
+        attention_value_bands: list[BandSpec] | None,
+        attention_backend: str,
         attention_band_bias: bool,
         attention_chunk_size: int,
+        attention_flex_block_size: int,
         attention_checkpoint: bool,
     ):
         super().__init__()
@@ -631,48 +686,138 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.attention_mode = attention_mode
         self.attention_bands = attention_bands
+        self.attention_value_bands = attention_value_bands if attention_mode != "baseline" else None
+        self.use_banded_values = self.attention_value_bands is not None
+        if attention_backend not in {"dense", "flex"}:
+            raise ValueError(f"ATTENTION_BACKEND must be dense or flex, got {attention_backend}")
+        if attention_backend == "flex" and attention_mode != "baseline" and not FLEX_ATTENTION_AVAILABLE:
+            raise RuntimeError("ATTENTION_BACKEND=flex requested, but torch.nn.attention.flex_attention is unavailable")
+        self.attention_backend = attention_backend
         if attention_chunk_size <= 0:
             raise ValueError(f"ATTENTION_CHUNK_SIZE must be positive, got {attention_chunk_size}")
+        if attention_flex_block_size <= 0:
+            raise ValueError(f"ATTENTION_FLEX_BLOCK_SIZE must be positive, got {attention_flex_block_size}")
         self.attention_chunk_size = attention_chunk_size
+        self.attention_flex_block_size = attention_flex_block_size
         self.attention_checkpoint = attention_checkpoint
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         for band in attention_bands:
             if attention_mode != "baseline" and band.dim > self.head_dim:
                 raise ValueError(f"Band dim {band.dim} exceeds head_dim={self.head_dim}")
-            if attention_mode == "distance_per_band" and band.dim % 2 != 0:
-                raise ValueError("distance_per_band requires even band dims for RoPE")
+            if attention_mode != "baseline" and band.dim % 2 != 0:
+                raise ValueError("Distance attention band dims must be even for RoPE")
+        if self.attention_value_bands is not None:
+            for band in self.attention_value_bands:
+                if band.dim > self.head_dim:
+                    raise ValueError(f"Value band dim {band.dim} exceeds head_dim={self.head_dim}")
         kv_dim = self.num_kv_heads * self.head_dim
+        self.band_q_splits = [num_heads * b.dim for b in attention_bands]
+        self.band_k_splits = [num_kv_heads * b.dim for b in attention_bands]
+        self.band_v_splits = (
+            [num_kv_heads * b.dim for b in self.attention_value_bands]
+            if self.attention_value_bands is not None
+            else []
+        )
         if attention_mode == "distance_per_band":
             self.c_q = None
             self.c_k = None
-            self.band_q = nn.ModuleList([CastedLinear(dim, num_heads * b.dim, bias=False) for b in attention_bands])
-            self.band_k = nn.ModuleList([CastedLinear(dim, num_kv_heads * b.dim, bias=False) for b in attention_bands])
+            # One packed projection avoids launching one small matmul per band.
+            self.c_q_bands = CastedLinear(dim, sum(self.band_q_splits), bias=False)
+            self.c_k_bands = CastedLinear(dim, sum(self.band_k_splits), bias=False)
             self.band_rotary = nn.ModuleList([Rotary(b.dim, base=rope_base) for b in attention_bands])
             self.q_gain = nn.Parameter(torch.full((len(attention_bands), num_heads), qk_gain_init, dtype=torch.float32))
         else:
             self.c_q = CastedLinear(dim, dim, bias=False)
             self.c_k = CastedLinear(dim, kv_dim, bias=False)
+            self.c_q_bands = None
+            self.c_k_bands = None
+            self.band_rotary = nn.ModuleList()
             self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        if self.use_banded_values:
+            if self.attention_value_bands is None:
+                raise RuntimeError("attention_value_bands unexpectedly missing")
+            self.c_v = None
+            # Packed value projection; the per-band lift is applied after the low-dimensional PV.
+            self.c_v_bands = CastedLinear(dim, sum(self.band_v_splits), bias=False)
+            self.band_v_lift = nn.ModuleList(
+                [CastedLinear(b.dim, self.head_dim, bias=False) for b in self.attention_value_bands]
+            )
+        else:
+            self.c_v = CastedLinear(dim, kv_dim, bias=False)
+            self.c_v_bands = None
+            self.band_v_lift = nn.ModuleList()
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.rotary = Rotary(self.head_dim, base=rope_base)
         if attention_band_bias and attention_mode != "baseline":
-            self.band_bias = nn.Parameter(torch.zeros(len(attention_bands), dtype=torch.float32))
+            self.band_bias = nn.Parameter(torch.zeros(len(attention_bands), num_heads, dtype=torch.float32))
         else:
             self.register_parameter("band_bias", None)
+        self.flex_kernel_options = {
+            "BLOCK_M": self.attention_flex_block_size,
+            "BLOCK_N": self.attention_flex_block_size,
+            "BLOCKS_ARE_CONTIGUOUS": True,
+        }
 
-    def _band_mask(self, start: int, end: int, seq_len: int, band_idx: int, device: torch.device) -> Tensor:
-        q_pos = torch.arange(start, end, device=device)
-        k_pos = torch.arange(seq_len, device=device)
-        dist = q_pos[:, None] - k_pos[None, :]
+    def _band_bounds(self, band_idx: int) -> tuple[int, int | None]:
         lower = 0 if band_idx == 0 else (self.attention_bands[band_idx - 1].max_distance or 0) + 1
         upper = self.attention_bands[band_idx].max_distance
+        return lower, upper
+
+    def _band_key_range(self, start: int, end: int, seq_len: int, band_idx: int) -> tuple[int, int] | None:
+        # Union of possible key positions for this query chunk and distance band.
+        # This keeps the dense reference from multiplying by keys that will be masked out.
+        lower, upper = self._band_bounds(band_idx)
+        k0 = 0 if upper is None else max(0, start - upper)
+        k1 = min(seq_len, end - lower)
+        return None if k1 <= k0 else (k0, k1)
+
+    def _band_mask(
+        self,
+        start: int,
+        end: int,
+        key_start: int,
+        key_end: int,
+        band_idx: int,
+        device: torch.device,
+    ) -> Tensor:
+        q_pos = torch.arange(start, end, device=device)
+        k_pos = torch.arange(key_start, key_end, device=device)
+        dist = q_pos[:, None] - k_pos[None, :]
+        lower, upper = self._band_bounds(band_idx)
         mask = dist >= lower
         if upper is not None:
             mask = mask & (dist <= upper)
         return mask[None, None, :, :]
+
+    def _flex_band_mask(self, seq_len: int, band_idx: int, device: torch.device):
+        if create_block_mask is None:
+            raise RuntimeError("FlexAttention block-mask creation is unavailable")
+        mask_compile = bool(int(os.environ.get("ATTENTION_COMPILE_BLOCK_MASK", "0")))
+        bands_key = tuple((b.max_distance, b.dim) for b in self.attention_bands)
+        key = (seq_len, band_idx, str(device), self.attention_flex_block_size, bands_key, mask_compile)
+        if key not in _GLOBAL_FLEX_MASK_CACHE:
+            lower, upper = self._band_bounds(band_idx)
+
+            def mask_mod(_batch, _head, q_idx, kv_idx):
+                dist = q_idx - kv_idx
+                mask = dist >= lower
+                if upper is not None:
+                    mask = mask & (dist <= upper)
+                return mask
+
+            _GLOBAL_FLEX_MASK_CACHE[key] = create_block_mask(
+                mask_mod,
+                None,
+                None,
+                seq_len,
+                seq_len,
+                device=device,
+                BLOCK_SIZE=self.attention_flex_block_size,
+                _compile=mask_compile,
+            )
+        return _GLOBAL_FLEX_MASK_CACHE[key]
 
     def _distance_qk_bands(
         self,
@@ -680,59 +825,113 @@ class CausalSelfAttention(nn.Module):
         q_full: Tensor | None,
         k_full: Tensor | None,
     ) -> tuple[list[Tensor], list[Tensor]]:
-        bsz, seqlen, dim = x.shape
+        bsz, seqlen, _ = x.shape
         q_bands: list[Tensor] = []
         k_bands: list[Tensor] = []
+        if self.attention_mode == "distance_prefix":
+            if q_full is None or k_full is None:
+                raise RuntimeError("distance_prefix requires shared Q/K projections")
+            for band in self.attention_bands:
+                q_bands.append(rotary_pair_prefix(q_full, band.dim))
+                k_bands.append(rotary_pair_prefix(k_full, band.dim))
+            return q_bands, k_bands
+
+        if self.c_q_bands is None or self.c_k_bands is None:
+            raise RuntimeError("distance_per_band requires packed band Q/K projections")
+        q_parts = self.c_q_bands(x).split(self.band_q_splits, dim=-1)
+        k_parts = self.c_k_bands(x).split(self.band_k_splits, dim=-1)
         for band_idx, band in enumerate(self.attention_bands):
-            if self.attention_mode == "distance_prefix":
-                if q_full is None or k_full is None:
-                    raise RuntimeError("distance_prefix requires shared Q/K projections")
-                q_band = q_full[..., : band.dim]
-                k_band = k_full[..., : band.dim]
-            else:
-                q_band = self.band_q[band_idx](x).reshape(bsz, seqlen, self.num_heads, band.dim).transpose(1, 2)
-                k_band = self.band_k[band_idx](x).reshape(bsz, seqlen, self.num_kv_heads, band.dim).transpose(1, 2)
-                q_band = F.rms_norm(q_band, (q_band.size(-1),))
-                k_band = F.rms_norm(k_band, (k_band.size(-1),))
-                cos, sin = self.band_rotary[band_idx](seqlen, x.device, q_band.dtype)
-                q_band = apply_rotary_emb(q_band, cos, sin)
-                k_band = apply_rotary_emb(k_band, cos, sin)
-                q_band = q_band * self.q_gain[band_idx].to(dtype=q_band.dtype)[None, :, None, None]
+            q_band = q_parts[band_idx].reshape(bsz, seqlen, self.num_heads, band.dim).transpose(1, 2)
+            k_band = k_parts[band_idx].reshape(bsz, seqlen, self.num_kv_heads, band.dim).transpose(1, 2)
+            q_band = F.rms_norm(q_band, (q_band.size(-1),))
+            k_band = F.rms_norm(k_band, (k_band.size(-1),))
+            cos, sin = self.band_rotary[band_idx](seqlen, x.device, q_band.dtype)
+            q_band = apply_rotary_emb(q_band, cos, sin)
+            k_band = apply_rotary_emb(k_band, cos, sin)
+            q_band = q_band * self.q_gain[band_idx].to(dtype=q_band.dtype)[None, :, None, None]
             q_bands.append(q_band)
             k_bands.append(k_band)
         return q_bands, k_bands
+
+    def _distance_value_bands(self, x: Tensor) -> list[Tensor]:
+        if self.attention_value_bands is None or self.c_v_bands is None:
+            raise RuntimeError("distance-banded values are not enabled")
+        bsz, seqlen, _ = x.shape
+        value_parts = self.c_v_bands(x).split(self.band_v_splits, dim=-1)
+        value_bands: list[Tensor] = []
+        for band_idx, band in enumerate(self.attention_value_bands):
+            value_band = value_parts[band_idx].reshape(bsz, seqlen, self.num_kv_heads, band.dim).transpose(1, 2)
+            value_bands.append(value_band)
+        return value_bands
 
     def _distance_attention_chunk(
         self,
         start: int,
         end: int,
         seqlen: int,
-        v: Tensor,
+        v: Tensor | None,
         q_bands: tuple[Tensor, ...],
         k_bands: tuple[Tensor, ...],
+        v_bands: tuple[Tensor, ...],
     ) -> Tensor:
-        scores: Tensor | None = None
+        q0 = q_bands[0][:, :, start:end, :]
+        scores = torch.full(
+            (q0.size(0), self.num_heads, end - start, seqlen),
+            torch.finfo(q0.dtype).min,
+            device=q0.device,
+            dtype=q0.dtype,
+        )
+        band_entries: list[tuple[int, int, int, Tensor]] = []
         for band_idx, band in enumerate(self.attention_bands):
+            key_range = self._band_key_range(start, end, seqlen, band_idx)
+            if key_range is None:
+                continue
+            k0, k1 = key_range
             q_band = q_bands[band_idx][:, :, start:end, :]
-            k_band = expand_kv_for_gqa(k_bands[band_idx], self.num_heads)
+            k_band = expand_kv_for_gqa(k_bands[band_idx][:, :, k0:k1, :], self.num_heads)
             band_scores = (q_band @ k_band.transpose(-2, -1)) * (band.dim ** -0.5)
             if self.band_bias is not None:
-                band_scores = band_scores + self.band_bias[band_idx].to(dtype=band_scores.dtype)
-            if scores is None:
-                scores = torch.full_like(band_scores, torch.finfo(band_scores.dtype).min)
-            mask = self._band_mask(start, end, seqlen, band_idx, band_scores.device)
-            scores = torch.where(mask, band_scores, scores)
-        if scores is None:
-            raise RuntimeError("distance attention requires at least one band")
-        y = F.softmax(scores.float(), dim=-1).to(dtype=v.dtype) @ v
+                band_scores = band_scores + self.band_bias[band_idx].to(dtype=band_scores.dtype)[None, :, None, None]
+            mask = self._band_mask(start, end, k0, k1, band_idx, band_scores.device)
+            band_entries.append((band_idx, k0, k1, mask))
+            scores[..., k0:k1] = torch.where(mask, band_scores, scores[..., k0:k1])
+        probs = F.softmax(scores.float(), dim=-1)
+        if self.use_banded_values:
+            if self.attention_value_bands is None:
+                raise RuntimeError("attention_value_bands unexpectedly missing")
+            if len(v_bands) != len(self.attention_value_bands):
+                raise RuntimeError("Expected one value tensor per value band")
+            first_v = v_bands[0]
+            y = torch.zeros(
+                first_v.size(0),
+                self.num_heads,
+                end - start,
+                self.head_dim,
+                device=first_v.device,
+                dtype=first_v.dtype,
+            )
+            for band_idx, k0, k1, mask in band_entries:
+                v_band = expand_kv_for_gqa(v_bands[band_idx][:, :, k0:k1, :], self.num_heads)
+                band_probs = torch.where(
+                    mask,
+                    probs[..., k0:k1],
+                    torch.zeros((), device=probs.device, dtype=probs.dtype),
+                )
+                y_low = band_probs.to(dtype=v_band.dtype) @ v_band
+                y = y + self.band_v_lift[band_idx](y_low).to(dtype=y.dtype)
+            return y
+        if v is None:
+            raise RuntimeError("Full-dimensional values are required when value banding is disabled")
+        y = probs.to(dtype=v.dtype) @ v
         return y
 
-    def _distance_attention(self, x: Tensor, v: Tensor, q_full: Tensor | None, k_full: Tensor | None) -> Tensor:
+    def _distance_attention(self, x: Tensor, v: Tensor | None, q_full: Tensor | None, k_full: Tensor | None) -> Tensor:
         bsz, seqlen, dim = x.shape
-        v = expand_kv_for_gqa(v, self.num_heads)
+        full_v = None if self.use_banded_values else expand_kv_for_gqa(v, self.num_heads)
         q_bands, k_bands = self._distance_qk_bands(x, q_full, k_full)
         q_tuple = tuple(q_bands)
         k_tuple = tuple(k_bands)
+        v_tuple = tuple(self._distance_value_bands(x)) if self.use_banded_values else ()
         chunks: list[Tensor] = []
         chunk_size = min(self.attention_chunk_size, seqlen)
         for start in range(0, seqlen, chunk_size):
@@ -741,29 +940,123 @@ class CausalSelfAttention(nn.Module):
                 num_bands = len(q_tuple)
                 chunk_start = start
                 chunk_end = end
+                value_inputs = v_tuple if self.use_banded_values else (full_v,)
 
                 def run_chunk(
-                    v_in: Tensor,
                     *qk_tensors: Tensor,
                     chunk_start: int = chunk_start,
                     chunk_end: int = chunk_end,
                 ) -> Tensor:
                     q_inputs = qk_tensors[:num_bands]
-                    k_inputs = qk_tensors[num_bands:]
-                    return self._distance_attention_chunk(chunk_start, chunk_end, seqlen, v_in, q_inputs, k_inputs)
+                    k_inputs = qk_tensors[num_bands : 2 * num_bands]
+                    v_inputs = qk_tensors[2 * num_bands :]
+                    if self.use_banded_values:
+                        return self._distance_attention_chunk(
+                            chunk_start, chunk_end, seqlen, None, q_inputs, k_inputs, v_inputs
+                        )
+                    return self._distance_attention_chunk(
+                        chunk_start, chunk_end, seqlen, v_inputs[0], q_inputs, k_inputs, ()
+                    )
 
-                y_chunk = checkpoint(run_chunk, v, *q_tuple, *k_tuple, use_reentrant=False)
+                y_chunk = checkpoint(run_chunk, *q_tuple, *k_tuple, *value_inputs, use_reentrant=False)
             else:
-                y_chunk = self._distance_attention_chunk(start, end, seqlen, v, q_tuple, k_tuple)
+                y_chunk = self._distance_attention_chunk(start, end, seqlen, full_v, q_tuple, k_tuple, v_tuple)
             chunks.append(y_chunk)
         y = torch.cat(chunks, dim=2)
         return y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
 
+    def _flex_attention_with_lse(
+        self,
+        q: Tensor,
+        k: Tensor,
+        value: Tensor,
+        band_idx: int,
+        band_dim: int,
+    ) -> tuple[Tensor, Tensor]:
+        if flex_attention is None or AuxRequest is None:
+            raise RuntimeError("FlexAttention is unavailable")
+        block_mask = self._flex_band_mask(q.size(2), band_idx, q.device)
+        out, aux = flex_attention(
+            q.contiguous(),
+            k.contiguous(),
+            value.contiguous(),
+            score_mod=None,
+            block_mask=block_mask,
+            scale=band_dim ** -0.5,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
+            kernel_options=self.flex_kernel_options,
+            return_aux=AuxRequest(lse=True),
+        )
+        if aux.lse is None:
+            raise RuntimeError("FlexAttention did not return logsumexp statistics")
+        lse = aux.lse
+        # A constant per-band bias does not affect the within-band softmax output;
+        # it only shifts the band's logsumexp before the global LSE recombination.
+        if self.band_bias is not None:
+            lse = lse + self.band_bias[band_idx].to(dtype=lse.dtype)[None, :, None]
+        return out, lse
+
+    def _distance_attention_flex(
+        self,
+        x: Tensor,
+        v: Tensor | None,
+        q_full: Tensor | None,
+        k_full: Tensor | None,
+    ) -> Tensor:
+        if x.device.type == "cpu" and torch.is_grad_enabled() and x.requires_grad:
+            raise RuntimeError("ATTENTION_BACKEND=flex does not support CPU backward; use DEVICE=cuda or ATTENTION_BACKEND=dense")
+        bsz, seqlen, dim = x.shape
+        if not self.use_banded_values and v is None:
+            raise RuntimeError("Full-dimensional values are required when value banding is disabled")
+        q_bands, k_bands = self._distance_qk_bands(x, q_full, k_full)
+        v_bands = self._distance_value_bands(x) if self.use_banded_values else None
+
+        outputs: list[Tensor] = []
+        lses: list[Tensor] = []
+        for band_idx, band in enumerate(self.attention_bands):
+            band_value = v_bands[band_idx] if v_bands is not None else v
+            if band_value is None:
+                raise RuntimeError("Missing value tensor for FlexAttention")
+            out, lse = self._flex_attention_with_lse(
+                q_bands[band_idx],
+                k_bands[band_idx],
+                band_value,
+                band_idx,
+                band.dim,
+            )
+            if self.use_banded_values:
+                out = self.band_v_lift[band_idx](out)
+            outputs.append(out)
+            lses.append(lse)
+
+        global_lse = torch.logsumexp(torch.stack(lses, dim=0), dim=0)
+        y = torch.zeros(
+            bsz,
+            self.num_heads,
+            seqlen,
+            self.head_dim,
+            device=x.device,
+            dtype=outputs[0].dtype,
+        )
+        for out, lse in zip(outputs, lses, strict=True):
+            weight = torch.exp(lse - global_lse).to(dtype=out.dtype)[..., None]
+            y = y + weight * out
+        return y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        if self.use_banded_values:
+            v = None
+        else:
+            if self.c_v is None:
+                raise RuntimeError("Full-dimensional value projection is not initialized")
+            v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         if self.attention_mode == "distance_per_band":
-            y = self._distance_attention(x, v, None, None)
+            y = (
+                self._distance_attention_flex(x, v, None, None)
+                if self.attention_backend == "flex"
+                else self._distance_attention(x, v, None, None)
+            )
             return self.proj(y)
         if self.c_q is None or self.c_k is None:
             raise RuntimeError("Shared Q/K projections are not initialized")
@@ -776,8 +1069,14 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         if self.attention_mode == "distance_prefix":
-            y = self._distance_attention(x, v, q, k)
+            y = (
+                self._distance_attention_flex(x, v, q, k)
+                if self.attention_backend == "flex"
+                else self._distance_attention(x, v, q, k)
+            )
             return self.proj(y)
+        if v is None:
+            raise RuntimeError("Baseline attention requires full-dimensional values")
         y = F.scaled_dot_product_attention(
             q,
             k,
@@ -815,8 +1114,11 @@ class Block(nn.Module):
         qk_gain_init: float,
         attention_mode: str,
         attention_bands: list[BandSpec],
+        attention_value_bands: list[BandSpec] | None,
+        attention_backend: str,
         attention_band_bias: bool,
         attention_chunk_size: int,
+        attention_flex_block_size: int,
         attention_checkpoint: bool,
     ):
         super().__init__()
@@ -830,8 +1132,11 @@ class Block(nn.Module):
             qk_gain_init,
             attention_mode,
             attention_bands,
+            attention_value_bands,
+            attention_backend,
             attention_band_bias,
             attention_chunk_size,
+            attention_flex_block_size,
             attention_checkpoint,
         )
         self.mlp = MLP(dim, mlp_mult)
@@ -864,8 +1169,11 @@ class GPT(nn.Module):
         qk_gain_init: float,
         attention_mode: str,
         attention_bands: list[BandSpec],
+        attention_value_bands: list[BandSpec] | None,
+        attention_backend: str,
         attention_band_bias: bool,
         attention_chunk_size: int,
+        attention_flex_block_size: int,
         attention_checkpoint: bool,
     ):
         super().__init__()
@@ -890,8 +1198,11 @@ class GPT(nn.Module):
                     qk_gain_init,
                     attention_mode,
                     attention_bands,
+                    attention_value_bands,
+                    attention_backend,
                     attention_band_bias,
                     attention_chunk_size,
+                    attention_flex_block_size,
                     attention_checkpoint,
                 )
                 for i in range(num_layers)
@@ -947,40 +1258,83 @@ def main() -> None:
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     attention_bands = parse_band_spec(args.attention_bands)
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    attention_value_bands = parse_value_band_spec(args.attention_value_bands, attention_bands)
+    if args.attention_backend not in {"auto", "dense", "flex"}:
+        raise ValueError(f"ATTENTION_BACKEND must be auto, dense, or flex, got: {args.attention_backend}")
 
     # -----------------------------
-    # DISTRIBUTED + CUDA SETUP
+    # DISTRIBUTED + DEVICE SETUP
     # -----------------------------
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if args.device not in {"auto", "cuda", "cpu"}:
+        raise ValueError(f"DEVICE must be one of auto|cuda|cpu, got: {args.device}")
+    wants_cuda = args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("DEVICE=cuda requested but CUDA is not available")
+    device = torch.device("cuda", local_rank) if wants_cuda else torch.device("cpu")
+    use_cuda = device.type == "cuda"
+    autocast_enabled = use_cuda
+    autocast_device_type = "cuda" if use_cuda else "cpu"
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+    if distributed and world_size > 1 and not use_cuda:
+        raise RuntimeError("Distributed multi-process training currently requires CUDA (WORLD_SIZE>1 with DEVICE=cpu is unsupported)")
     grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required")
-    device = torch.device("cuda", local_rank)
-    torch.cuda.set_device(device)
+    if use_cuda:
+        torch.cuda.set_device(device)
+    if args.attention_backend == "auto":
+        args.attention_backend = (
+            "flex" if args.attention_mode != "baseline" and use_cuda and FLEX_ATTENTION_AVAILABLE else "dense"
+        )
+    if args.attention_backend == "flex" and args.attention_mode != "baseline" and not FLEX_ATTENTION_AVAILABLE:
+        raise RuntimeError("ATTENTION_BACKEND=flex requested, but torch.nn.attention.flex_attention is unavailable")
+    if args.attention_backend == "flex" and args.attention_mode != "baseline" and not use_cuda:
+        raise RuntimeError("ATTENTION_BACKEND=flex currently requires CUDA for training; use ATTENTION_BACKEND=dense on CPU")
     if distributed:
-        dist.init_process_group(backend="nccl", device_id=device)
+        backend = "nccl" if use_cuda else "gloo"
+        dist.init_process_group(backend=backend)
         dist.barrier()
     master_process = rank == 0
 
-    # Fast math knobs
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+    if args.torch_compile:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
-    enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    # Fast math knobs
+    if use_cuda:
+        if args.sdp_kernel_mode not in {"auto", "flash_only", "math_only", "mem_efficient_only"}:
+            raise ValueError(
+                "SDP_KERNEL_MODE must be one of auto|flash_only|math_only|mem_efficient_only, "
+                f"got: {args.sdp_kernel_mode}"
+            )
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+
+        enable_cudnn_sdp(False)
+        if args.sdp_kernel_mode == "flash_only":
+            enable_flash_sdp(True)
+            enable_mem_efficient_sdp(False)
+            enable_math_sdp(False)
+        elif args.sdp_kernel_mode == "math_only":
+            enable_flash_sdp(False)
+            enable_mem_efficient_sdp(False)
+            enable_math_sdp(True)
+        elif args.sdp_kernel_mode == "mem_efficient_only":
+            enable_flash_sdp(False)
+            enable_mem_efficient_sdp(True)
+            enable_math_sdp(False)
+        else:
+            # Prefer flash when available, but keep safe fallbacks enabled.
+            enable_flash_sdp(True)
+            enable_mem_efficient_sdp(True)
+            enable_math_sdp(True)
 
     logfile = None
     if master_process:
@@ -1001,10 +1355,13 @@ def main() -> None:
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
-    log0(
-        subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
-        console=False,
-    )
+    if use_cuda:
+        log0(
+            subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
+            console=False,
+        )
+    else:
+        log0("Running on CPU", console=False)
     log0("=" * 100, console=False)
 
     # -----------------------------
@@ -1014,22 +1371,34 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    if use_cuda:
+        torch.cuda.manual_seed_all(args.seed)
 
-    if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
-    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+    tokenizer_path = Path(args.tokenizer_path).resolve()
+    if not tokenizer_path.is_file():
+        raise FileNotFoundError(
+            f"TOKENIZER_PATH does not exist: {tokenizer_path}. "
+            "Run scripts/download_parameter_golf_data.sh or set TOKENIZER_PATH to a valid .model file."
+        )
+    if not tokenizer_path.name.endswith(".model"):
+        raise ValueError(f"Script only setup for SentencePiece .model file: {tokenizer_path}")
+    sp = spm.SentencePieceProcessor(model_file=str(tokenizer_path))
     if int(sp.vocab_size()) != args.vocab_size:
         raise ValueError(
             f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
         )
     dataset_dir = Path(args.data_path).resolve()
+    if not dataset_dir.is_dir():
+        raise FileNotFoundError(
+            f"DATA_PATH does not exist: {dataset_dir}. "
+            "Run scripts/download_parameter_golf_data.sh or set DATA_PATH to the FineWeb shard directory."
+        )
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
@@ -1037,6 +1406,7 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    model_dtype = torch.bfloat16 if use_cuda else torch.float32
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1051,10 +1421,13 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         attention_mode=args.attention_mode,
         attention_bands=attention_bands,
+        attention_value_bands=attention_value_bands,
+        attention_backend=args.attention_backend,
         attention_band_bias=args.attention_band_bias,
         attention_chunk_size=args.attention_chunk_size,
+        attention_flex_block_size=args.attention_flex_block_size,
         attention_checkpoint=args.attention_checkpoint,
-    ).to(device).bfloat16()
+    ).to(device=device, dtype=model_dtype)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1067,7 +1440,12 @@ def main() -> None:
         )
     else:
         compiled_model = base_model
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    if distributed:
+        model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if use_cuda else DDP(
+            compiled_model, device_ids=None, broadcast_buffers=False
+        )
+    else:
+        model = compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1088,11 +1466,12 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    fused_adam = use_cuda
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
-        fused=True,
+        fused=fused_adam,
     )
     optimizer_muon = Muon(
         matrix_params,
@@ -1106,7 +1485,7 @@ def main() -> None:
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
-        fused=True,
+        fused=fused_adam,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
@@ -1114,17 +1493,29 @@ def main() -> None:
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
-            fused=True,
+            fused=fused_adam,
         )
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    if use_cuda:
+        log0(f"sdp_kernel_mode:{args.sdp_kernel_mode}")
+        log0(
+            "sdp_backends:"
+            f"cudnn={int(torch.backends.cuda.cudnn_sdp_enabled())} "
+            f"flash={int(torch.backends.cuda.flash_sdp_enabled())} "
+            f"mem_efficient={int(torch.backends.cuda.mem_efficient_sdp_enabled())} "
+            f"math={int(torch.backends.cuda.math_sdp_enabled())}"
+        )
+    else:
+        log0("sdp_backends:cpu")
     log0(
         f"attention_mode:{args.attention_mode} num_heads:{args.num_heads} "
         f"num_kv_heads:{args.num_kv_heads} bands:{format_band_spec(attention_bands)} "
+        f"value_bands:{format_band_spec(attention_value_bands) if attention_value_bands is not None else 'full'} "
+        f"attention_backend:{args.attention_backend} flex_block_size:{args.attention_flex_block_size} "
         f"band_bias:{int(args.attention_band_bias)} "
         f"chunk_size:{args.attention_chunk_size} checkpoint:{int(args.attention_checkpoint)} "
         f"torch_compile:{int(args.torch_compile)}"
@@ -1176,7 +1567,9 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(
+                    device_type=autocast_device_type, dtype=torch.bfloat16, enabled=autocast_enabled
+                ):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1198,7 +1591,8 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    torch.cuda.synchronize()
+    if use_cuda:
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     step = 0
@@ -1207,7 +1601,8 @@ def main() -> None:
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
-            torch.cuda.synchronize()
+            if use_cuda:
+                torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
                 args,
@@ -1216,6 +1611,8 @@ def main() -> None:
                 world_size,
                 device,
                 grad_accum_steps,
+                autocast_enabled,
+                autocast_device_type,
                 val_tokens,
                 base_bytes_lut,
                 has_leading_space_lut,
@@ -1225,7 +1622,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
-            torch.cuda.synchronize()
+            if use_cuda:
+                torch.cuda.synchronize()
             t0 = time.perf_counter()
 
         if last_step:
@@ -1244,7 +1642,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type=autocast_device_type, dtype=torch.bfloat16, enabled=autocast_enabled):
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
@@ -1286,10 +1684,13 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-    log0(
-        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
+    if use_cuda:
+        log0(
+            f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+            f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
+        )
+    else:
+        log0("peak memory allocated: n/a (cpu)")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1329,7 +1730,8 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
+    if use_cuda:
+        torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
@@ -1338,12 +1740,15 @@ def main() -> None:
         world_size,
         device,
         grad_accum_steps,
+        autocast_enabled,
+        autocast_device_type,
         val_tokens,
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
     )
-    torch.cuda.synchronize()
+    if use_cuda:
+        torch.cuda.synchronize()
     log0(
         f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
